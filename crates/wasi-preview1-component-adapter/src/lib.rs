@@ -60,7 +60,6 @@ pub mod bindings {
 #[export_name = "wasi:cli/run@0.2.0-rc-2023-11-10#run"]
 #[cfg(feature = "command")]
 pub unsafe extern "C" fn run() -> u32 {
-    #[link(wasm_import_module = "__main_module__")]
     extern "C" {
         fn _start();
     }
@@ -119,30 +118,26 @@ pub unsafe extern "C" fn cabi_import_realloc(
     ptr
 }
 
+extern "C" {
+   fn malloc(size: usize) -> *mut ();
+}
+
 /// Bump-allocated memory arena. This is a singleton - the
 /// memory will be sized according to `bump_arena_size()`.
 pub struct BumpArena {
-    data: MaybeUninit<[u8; bump_arena_size()]>,
-    position: Cell<usize>,
+    _data: MaybeUninit<[u8; bump_arena_size()]>,
+    _position: Cell<usize>,
 }
 
 impl BumpArena {
     fn new() -> Self {
         BumpArena {
-            data: MaybeUninit::uninit(),
-            position: Cell::new(0),
+            _data: MaybeUninit::uninit(),
+            _position: Cell::new(0),
         }
     }
-    fn alloc(&self, align: usize, size: usize) -> *mut u8 {
-        let start = self.data.as_ptr() as usize;
-        let next = start + self.position.get();
-        let alloc = align_to(next, align);
-        let offset = alloc - start;
-        if offset + size > bump_arena_size() {
-            unreachable!("out of memory");
-        }
-        self.position.set(offset + size);
-        alloc as *mut u8
+    fn alloc(&self, _align: usize, size: usize) -> *mut u8 {
+        unsafe { malloc(size) }.cast()
     }
 }
 fn align_to(ptr: usize, align: usize) -> usize {
@@ -258,7 +253,7 @@ pub unsafe extern "C" fn cabi_export_realloc(
 /// Read command-line argument data.
 /// The size of the array should match that returned by `args_sizes_get`
 #[no_mangle]
-pub unsafe extern "C" fn args_get(mut argv: *mut *mut u8, mut argv_buf: *mut u8) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_args_get(mut argv: *mut *mut u8, mut argv_buf: *mut u8) -> Errno {
     State::with(|state| {
         for arg in state.get_args() {
             // Copy the argument into `argv_buf` which must be sized
@@ -280,7 +275,7 @@ pub unsafe extern "C" fn args_get(mut argv: *mut *mut u8, mut argv_buf: *mut u8)
 
 /// Return command-line argument data sizes.
 #[no_mangle]
-pub unsafe extern "C" fn args_sizes_get(argc: *mut Size, argv_buf_size: *mut Size) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_args_sizes_get(argc: *mut Size, argv_buf_size: *mut Size) -> Errno {
     State::with(|state| {
         let args = state.get_args();
         *argc = args.len();
@@ -294,7 +289,7 @@ pub unsafe extern "C" fn args_sizes_get(argc: *mut Size, argv_buf_size: *mut Siz
 /// Read environment variable data.
 /// The sizes of the buffers should match that returned by `environ_sizes_get`.
 #[no_mangle]
-pub unsafe extern "C" fn environ_get(environ: *mut *mut u8, environ_buf: *mut u8) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_environ_get(environ: *mut *mut u8, environ_buf: *mut u8) -> Errno {
     State::with(|state| {
         let mut offsets = environ;
         let mut buffer = environ_buf;
@@ -321,7 +316,7 @@ pub unsafe extern "C" fn environ_get(environ: *mut *mut u8, environ_buf: *mut u8
 
 /// Return environment variable data sizes.
 #[no_mangle]
-pub unsafe extern "C" fn environ_sizes_get(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_environ_sizes_get(
     environc: *mut Size,
     environ_buf_size: *mut Size,
 ) -> Errno {
@@ -378,7 +373,7 @@ pub extern "C" fn clock_res_get(id: Clockid, resolution: &mut Timestamp) -> Errn
 /// Return the time value of a clock.
 /// Note: This is similar to `clock_gettime` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn clock_time_get(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_clock_time_get(
     id: Clockid,
     _precision: Timestamp,
     time: &mut Timestamp,
@@ -406,7 +401,7 @@ pub unsafe extern "C" fn clock_time_get(
 /// Provide file advisory information on a file descriptor.
 /// Note: This is similar to `posix_fadvise` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_advise(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_advise(
     fd: Fd,
     offset: Filesize,
     len: Filesize,
@@ -432,7 +427,7 @@ pub unsafe extern "C" fn fd_advise(
 /// Force the allocation of space in a file.
 /// Note: This is similar to `posix_fallocate` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_allocate(fd: Fd, _offset: Filesize, _len: Filesize) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_allocate(fd: Fd, _offset: Filesize, _len: Filesize) -> Errno {
     State::with(|state| {
         let ds = state.descriptors();
         // For not-files, fail with BADF
@@ -445,7 +440,7 @@ pub unsafe extern "C" fn fd_allocate(fd: Fd, _offset: Filesize, _len: Filesize) 
 /// Close a file descriptor.
 /// Note: This is similar to `close` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_close(fd: Fd) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_close(fd: Fd) -> Errno {
     State::with(|state| {
         // If there's a dirent cache entry for this file descriptor then drop
         // it since the descriptor is being closed and future calls to
@@ -462,7 +457,7 @@ pub unsafe extern "C" fn fd_close(fd: Fd) -> Errno {
 /// Synchronize the data of a file to disk.
 /// Note: This is similar to `fdatasync` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_datasync(fd: Fd) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_datasync(fd: Fd) -> Errno {
     State::with(|state| {
         let ds = state.descriptors();
         let file = ds.get_file(fd)?;
@@ -474,7 +469,7 @@ pub unsafe extern "C" fn fd_datasync(fd: Fd) -> Errno {
 /// Get the attributes of a file descriptor.
 /// Note: This returns similar flags to `fsync(fd, F_GETFL)` in POSIX, as well as additional fields.
 #[no_mangle]
-pub unsafe extern "C" fn fd_fdstat_get(fd: Fd, stat: *mut Fdstat) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_fdstat_get(fd: Fd, stat: *mut Fdstat) -> Errno {
     State::with(|state| {
         let ds = state.descriptors();
         match ds.get(fd)? {
@@ -595,7 +590,7 @@ pub unsafe extern "C" fn fd_fdstat_get(fd: Fd, stat: *mut Fdstat) -> Errno {
 /// Adjust the flags associated with a file descriptor.
 /// Note: This is similar to `fcntl(fd, F_SETFL, flags)` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_fdstat_set_flags(fd: Fd, flags: Fdflags) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_fdstat_set_flags(fd: Fd, flags: Fdflags) -> Errno {
     // Only support changing the NONBLOCK or APPEND flags.
     if flags & !(FDFLAGS_NONBLOCK | FDFLAGS_APPEND) != 0 {
         return wasi::ERRNO_INVAL;
@@ -622,7 +617,7 @@ pub unsafe extern "C" fn fd_fdstat_set_flags(fd: Fd, flags: Fdflags) -> Errno {
 
 /// Does not do anything if `fd` corresponds to a valid descriptor and returns [`wasi::ERRNO_BADF`] otherwise.
 #[no_mangle]
-pub unsafe extern "C" fn fd_fdstat_set_rights(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_fdstat_set_rights(
     fd: Fd,
     _fs_rights_base: Rights,
     _fs_rights_inheriting: Rights,
@@ -638,7 +633,7 @@ pub unsafe extern "C" fn fd_fdstat_set_rights(
 
 /// Return the attributes of an open file.
 #[no_mangle]
-pub unsafe extern "C" fn fd_filestat_get(fd: Fd, buf: *mut Filestat) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_filestat_get(fd: Fd, buf: *mut Filestat) -> Errno {
     State::with(|state| {
         let ds = state.descriptors();
         match ds.get(fd)? {
@@ -686,7 +681,7 @@ pub unsafe extern "C" fn fd_filestat_get(fd: Fd, buf: *mut Filestat) -> Errno {
 /// Adjust the size of an open file. If this increases the file's size, the extra bytes are filled with zeros.
 /// Note: This is similar to `ftruncate` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_filestat_set_size(fd: Fd, size: Filesize) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_filestat_set_size(fd: Fd, size: Filesize) -> Errno {
     State::with(|state| {
         let ds = state.descriptors();
         let file = ds.get_file(fd)?;
@@ -713,7 +708,7 @@ fn systimespec(set: bool, ts: Timestamp, now: bool) -> Result<filesystem::NewTim
 /// Adjust the timestamps of an open file or directory.
 /// Note: This is similar to `futimens` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_filestat_set_times(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_filestat_set_times(
     fd: Fd,
     atim: Timestamp,
     mtim: Timestamp,
@@ -740,7 +735,7 @@ pub unsafe extern "C" fn fd_filestat_set_times(
 /// Read from a file descriptor, without using and updating the file descriptor's offset.
 /// Note: This is similar to `preadv` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_pread(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_pread(
     fd: Fd,
     mut iovs_ptr: *const Iovec,
     mut iovs_len: usize,
@@ -782,7 +777,7 @@ pub unsafe extern "C" fn fd_pread(
 
 /// Return a description of the given preopened file descriptor.
 #[no_mangle]
-pub unsafe extern "C" fn fd_prestat_get(fd: Fd, buf: *mut Prestat) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_prestat_get(fd: Fd, buf: *mut Prestat) -> Errno {
     if matches!(
         get_allocation_state(),
         AllocationState::StackAllocated | AllocationState::StateAllocated
@@ -811,7 +806,7 @@ pub unsafe extern "C" fn fd_prestat_get(fd: Fd, buf: *mut Prestat) -> Errno {
 
 /// Return a description of the given preopened file descriptor.
 #[no_mangle]
-pub unsafe extern "C" fn fd_prestat_dir_name(fd: Fd, path: *mut u8, path_max_len: Size) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_prestat_dir_name(fd: Fd, path: *mut u8, path_max_len: Size) -> Errno {
     State::with(|state| {
         let ds = state.descriptors();
         if let Some(preopen) = ds.get_preopen(fd) {
@@ -830,7 +825,7 @@ pub unsafe extern "C" fn fd_prestat_dir_name(fd: Fd, path: *mut u8, path_max_len
 /// Write to a file descriptor, without using and updating the file descriptor's offset.
 /// Note: This is similar to `pwritev` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_pwrite(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_pwrite(
     fd: Fd,
     mut iovs_ptr: *const Ciovec,
     mut iovs_len: usize,
@@ -862,7 +857,7 @@ pub unsafe extern "C" fn fd_pwrite(
 /// Read from a file descriptor.
 /// Note: This is similar to `readv` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_read(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_read(
     fd: Fd,
     mut iovs_ptr: *const Iovec,
     mut iovs_len: usize,
@@ -946,7 +941,7 @@ fn stream_error_to_errno(err: streams::Error) -> Errno {
 /// read buffer size in case it's too small to fit a single large directory
 /// entry, or skip the oversized directory entry.
 #[no_mangle]
-pub unsafe extern "C" fn fd_readdir(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_readdir(
     fd: Fd,
     buf: *mut u8,
     buf_len: Size,
@@ -1181,14 +1176,14 @@ pub unsafe extern "C" fn fd_readdir(
 /// This function provides a way to atomically renumber file descriptors, which
 /// would disappear if `dup2()` were to be removed entirely.
 #[no_mangle]
-pub unsafe extern "C" fn fd_renumber(fd: Fd, to: Fd) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_renumber(fd: Fd, to: Fd) -> Errno {
     State::with(|state| state.descriptors_mut().renumber(fd, to))
 }
 
 /// Move the offset of a file descriptor.
 /// Note: This is similar to `lseek` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_seek(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_seek(
     fd: Fd,
     offset: Filedelta,
     whence: Whence,
@@ -1231,7 +1226,7 @@ pub unsafe extern "C" fn fd_seek(
 /// Synchronize the data and metadata of a file to disk.
 /// Note: This is similar to `fsync` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_sync(fd: Fd) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_sync(fd: Fd) -> Errno {
     State::with(|state| {
         let ds = state.descriptors();
         let file = ds.get_file(fd)?;
@@ -1243,7 +1238,7 @@ pub unsafe extern "C" fn fd_sync(fd: Fd) -> Errno {
 /// Return the current offset of a file descriptor.
 /// Note: This is similar to `lseek(fd, 0, SEEK_CUR)` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_tell(fd: Fd, offset: *mut Filesize) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_tell(fd: Fd, offset: *mut Filesize) -> Errno {
     State::with(|state| {
         let ds = state.descriptors();
         let file = ds.get_seekable_file(fd)?;
@@ -1255,7 +1250,7 @@ pub unsafe extern "C" fn fd_tell(fd: Fd, offset: *mut Filesize) -> Errno {
 /// Write to a file descriptor.
 /// Note: This is similar to `writev` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn fd_write(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_write(
     fd: Fd,
     mut iovs_ptr: *const Ciovec,
     mut iovs_len: usize,
@@ -1318,7 +1313,7 @@ pub unsafe extern "C" fn fd_write(
 /// Create a directory.
 /// Note: This is similar to `mkdirat` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_create_directory(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_create_directory(
     fd: Fd,
     path_ptr: *const u8,
     path_len: usize,
@@ -1336,7 +1331,7 @@ pub unsafe extern "C" fn path_create_directory(
 /// Return the attributes of a file or directory.
 /// Note: This is similar to `stat` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_filestat_get(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_filestat_get(
     fd: Fd,
     flags: Lookupflags,
     path_ptr: *const u8,
@@ -1369,7 +1364,7 @@ pub unsafe extern "C" fn path_filestat_get(
 /// Adjust the timestamps of a file or directory.
 /// Note: This is similar to `utimensat` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_filestat_set_times(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_filestat_set_times(
     fd: Fd,
     flags: Lookupflags,
     path_ptr: *const u8,
@@ -1403,7 +1398,7 @@ pub unsafe extern "C" fn path_filestat_set_times(
 /// Create a hard link.
 /// Note: This is similar to `linkat` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_link(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_link(
     old_fd: Fd,
     old_flags: Lookupflags,
     old_path_ptr: *const u8,
@@ -1433,7 +1428,7 @@ pub unsafe extern "C" fn path_link(
 /// guaranteed to be less than 2**31.
 /// Note: This is similar to `openat` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_open(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_open(
     fd: Fd,
     dirflags: Lookupflags,
     path_ptr: *const u8,
@@ -1484,7 +1479,7 @@ pub unsafe extern "C" fn path_open(
 /// Read the contents of a symbolic link.
 /// Note: This is similar to `readlinkat` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_readlink(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_readlink(
     fd: Fd,
     path_ptr: *const u8,
     path_len: usize,
@@ -1536,7 +1531,7 @@ pub unsafe extern "C" fn path_readlink(
 /// Return `errno::notempty` if the directory is not empty.
 /// Note: This is similar to `unlinkat(fd, path, AT_REMOVEDIR)` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_remove_directory(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_remove_directory(
     fd: Fd,
     path_ptr: *const u8,
     path_len: usize,
@@ -1554,7 +1549,7 @@ pub unsafe extern "C" fn path_remove_directory(
 /// Rename a file or directory.
 /// Note: This is similar to `renameat` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_rename(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_rename(
     old_fd: Fd,
     old_path_ptr: *const u8,
     old_path_len: usize,
@@ -1577,7 +1572,7 @@ pub unsafe extern "C" fn path_rename(
 /// Create a symbolic link.
 /// Note: This is similar to `symlinkat` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_symlink(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_symlink(
     old_path_ptr: *const u8,
     old_path_len: usize,
     fd: Fd,
@@ -1599,7 +1594,7 @@ pub unsafe extern "C" fn path_symlink(
 /// Return `errno::isdir` if the path refers to a directory.
 /// Note: This is similar to `unlinkat(fd, path, 0)` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn path_unlink_file(fd: Fd, path_ptr: *const u8, path_len: usize) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_unlink_file(fd: Fd, path_ptr: *const u8, path_len: usize) -> Errno {
     let path = slice::from_raw_parts(path_ptr, path_len);
 
     State::with(|state| {
@@ -1641,7 +1636,7 @@ impl Drop for Pollables {
 
 /// Concurrently poll for the occurrence of a set of events.
 #[no_mangle]
-pub unsafe extern "C" fn poll_oneoff(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_poll_oneoff(
     r#in: *const Subscription,
     out: *mut Event,
     nsubscriptions: Size,
@@ -1868,7 +1863,7 @@ pub unsafe extern "C" fn poll_oneoff(
 /// termination of the program. The meanings of other values is dependent on
 /// the environment.
 #[no_mangle]
-pub unsafe extern "C" fn proc_exit(rval: Exitcode) -> ! {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_proc_exit(rval: Exitcode) -> ! {
     let status = if rval == 0 { Ok(()) } else { Err(()) };
     exit::exit(status); // does not return
     unreachable!("host exit implementation didn't exit!") // actually unreachable
@@ -1877,14 +1872,14 @@ pub unsafe extern "C" fn proc_exit(rval: Exitcode) -> ! {
 /// Send a signal to the process of the calling thread.
 /// Note: This is similar to `raise` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn proc_raise(_sig: Signal) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_proc_raise(_sig: Signal) -> Errno {
     unreachable!()
 }
 
 /// Temporarily yield execution of the calling thread.
 /// Note: This is similar to `sched_yield` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn sched_yield() -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_sched_yield() -> Errno {
     // TODO: This is not yet covered in Preview2.
 
     ERRNO_SUCCESS
@@ -1897,7 +1892,7 @@ pub unsafe extern "C" fn sched_yield() -> Errno {
 /// required, it's advisable to use this function to seed a pseudo-random
 /// number generator, rather than to provide the random data directly.
 #[no_mangle]
-pub unsafe extern "C" fn random_get(buf: *mut u8, buf_len: Size) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_random_get(buf: *mut u8, buf_len: Size) -> Errno {
     if matches!(
         get_allocation_state(),
         AllocationState::StackAllocated | AllocationState::StateAllocated
@@ -1923,7 +1918,7 @@ pub unsafe extern "C" fn random_get(buf: *mut u8, buf_len: Size) -> Errno {
 /// Accept a new incoming connection.
 /// Note: This is similar to `accept` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn sock_accept(_fd: Fd, _flags: Fdflags, _connection: *mut Fd) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_sock_accept(_fd: Fd, _flags: Fdflags, _connection: *mut Fd) -> Errno {
     unreachable!()
 }
 
@@ -1931,7 +1926,7 @@ pub unsafe extern "C" fn sock_accept(_fd: Fd, _flags: Fdflags, _connection: *mut
 /// Note: This is similar to `recv` in POSIX, though it also supports reading
 /// the data into multiple buffers in the manner of `readv`.
 #[no_mangle]
-pub unsafe extern "C" fn sock_recv(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_sock_recv(
     _fd: Fd,
     _ri_data_ptr: *const Iovec,
     _ri_data_len: usize,
@@ -1946,7 +1941,7 @@ pub unsafe extern "C" fn sock_recv(
 /// Note: This is similar to `send` in POSIX, though it also supports writing
 /// the data from multiple buffers in the manner of `writev`.
 #[no_mangle]
-pub unsafe extern "C" fn sock_send(
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_sock_send(
     _fd: Fd,
     _si_data_ptr: *const Ciovec,
     _si_data_len: usize,
@@ -1959,7 +1954,7 @@ pub unsafe extern "C" fn sock_send(
 /// Shut down socket send and receive channels.
 /// Note: This is similar to `shutdown` in POSIX.
 #[no_mangle]
-pub unsafe extern "C" fn sock_shutdown(_fd: Fd, _how: Sdflags) -> Errno {
+pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_sock_shutdown(_fd: Fd, _how: Sdflags) -> Errno {
     unreachable!()
 }
 
@@ -2318,6 +2313,7 @@ const _: () = {
 
 #[allow(unused)]
 #[repr(i32)]
+#[derive(Clone, Copy)]
 enum AllocationState {
     StackUnallocated,
     StackAllocating,
@@ -2326,13 +2322,13 @@ enum AllocationState {
     StateAllocated,
 }
 
-#[allow(improper_ctypes)]
-extern "C" {
-    fn get_state_ptr() -> *mut State;
-    fn set_state_ptr(state: *mut State);
-    fn get_allocation_state() -> AllocationState;
-    fn set_allocation_state(state: AllocationState);
-}
+static mut STATE_PTR: *mut State = null_mut();
+static mut ALLOC_STATE: AllocationState = AllocationState::StackAllocated;
+
+unsafe fn get_state_ptr() -> *mut State { STATE_PTR }
+unsafe fn set_state_ptr(state: *mut State) { STATE_PTR = state; }
+unsafe fn get_allocation_state() -> AllocationState { ALLOC_STATE }
+unsafe fn set_allocation_state(state: AllocationState) { ALLOC_STATE= state; }
 
 impl State {
     fn with(f: impl FnOnce(&State) -> Result<(), Errno>) -> Errno {
@@ -2359,16 +2355,6 @@ impl State {
 
     #[cold]
     fn new() -> *mut State {
-        #[link(wasm_import_module = "__main_module__")]
-        extern "C" {
-            fn cabi_realloc(
-                old_ptr: *mut u8,
-                old_len: usize,
-                align: usize,
-                new_len: usize,
-            ) -> *mut u8;
-        }
-
         assert!(matches!(
             unsafe { get_allocation_state() },
             AllocationState::StackAllocated
@@ -2377,13 +2363,11 @@ impl State {
         unsafe { set_allocation_state(AllocationState::StateAllocating) };
 
         let ret = unsafe {
-            cabi_realloc(
-                ptr::null_mut(),
-                0,
-                mem::align_of::<UnsafeCell<State>>(),
+            malloc(
                 mem::size_of::<UnsafeCell<State>>(),
             ) as *mut State
         };
+        assert!(ret != null_mut());
 
         unsafe { set_allocation_state(AllocationState::StateAllocated) };
 
