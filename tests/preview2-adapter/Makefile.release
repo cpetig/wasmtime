@@ -1,0 +1,20 @@
+CC=/opt/wasi-sdk/bin/clang
+CFLAGS=--target=wasm32-wasi -O3 -mbulk-memory -mextended-const -msign-ext
+
+all: component2_r.wasm
+
+test_r.wasm: main.c
+	$(CC) $(CFLAGS) -s -o $@ $^ -lc -L../../target/wasm32-unknown-unknown/release -lwasi_snapshot_preview1 '-Wl,--export=wasi:cli/run@0.2.0-rc-2023-11-10#run' -Wl,--export=cabi_realloc \
+		-Wl,--extra-features=bulk-memory
+
+preview1_r.wasm: main.c
+	$(CC) $(CFLAGS) -s -o $@ $^
+
+component_r.wasm: preview1_r.wasm
+	wasm-tools component new $^ --adapt ../../target/wasm32-unknown-unknown/release/wasi_snapshot_preview1.wasm -o $@
+
+component2_r.wasm: test_r.wasm
+	wasm-tools component new $^ -o $@
+
+clean:
+	rm test_r.wasm preview1_r.wasm component_r.wasm component2_r.wasm 
