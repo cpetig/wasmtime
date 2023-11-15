@@ -233,7 +233,7 @@ impl ImportAlloc {
 /// (ish) limit. That's just an implementation limit though which can be lifted
 /// by dynamically calling the main module's allocator as necessary for more data.
 #[no_mangle]
-pub unsafe extern "C" fn cabi_export_realloc(
+pub unsafe extern "C" fn cabi_realloc(
     old_ptr: *mut u8,
     old_size: usize,
     align: usize,
