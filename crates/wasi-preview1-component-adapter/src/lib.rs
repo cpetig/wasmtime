@@ -2725,3 +2725,14 @@ impl State {
         self.args.get().trapping_unwrap()
     }
 }
+
+/// Thread redirection
+#[no_mangle]
+pub unsafe extern "C" fn __imported_wasi_thread_spawn(arg: u32) -> i32 {
+    #[link(wasm_import_module = "wasi:threads/threads")]
+    extern "C" {
+        #[link_name = "thread-spawn"]
+        fn thread_spawn(arg: u32) -> i32;
+    }
+    thread_spawn(arg)
+}
