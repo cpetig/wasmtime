@@ -24,7 +24,7 @@ pub(crate) enum RemKind {
 }
 
 /// Representation of the stack pointer offset.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, PartialOrd, Ord)]
 pub struct SPOffset(u32);
 
 impl SPOffset {
@@ -663,4 +663,17 @@ pub(crate) trait MacroAssembler {
 
     /// Trap if the source register is zero.
     fn trapz(&mut self, src: Reg, code: TrapCode);
+
+    /// Ensures that the stack pointer is correctly positioned before an unconditional
+    /// jump according to the requirements of the destination target.
+    fn ensure_sp_for_jump(&mut self, target: SPOffset) {
+        let bytes = self
+            .sp_offset()
+            .as_u32()
+            .checked_sub(target.as_u32())
+            .unwrap_or(0);
+        if bytes > 0 {
+            self.free_stack(bytes);
+        }
+    }
 }

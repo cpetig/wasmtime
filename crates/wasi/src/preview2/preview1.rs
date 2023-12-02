@@ -513,7 +513,7 @@ pub fn add_to_linker_sync<T: WasiPreview1View + Sync>(
 // None of the generated modules, traits, or types should be used externally
 // to this module.
 wiggle::from_witx!({
-    witx: ["$CARGO_MANIFEST_DIR/witx/wasi_snapshot_preview1.witx"],
+    witx: ["$CARGO_MANIFEST_DIR/witx/preview1/wasi_snapshot_preview1.witx"],
     async: {
         wasi_snapshot_preview1::{
             fd_advise, fd_close, fd_datasync, fd_fdstat_get, fd_filestat_get, fd_filestat_set_size,
@@ -531,7 +531,7 @@ mod sync {
     use std::future::Future;
 
     wiggle::wasmtime_integration!({
-        witx: ["$CARGO_MANIFEST_DIR/witx/wasi_snapshot_preview1.witx"],
+        witx: ["$CARGO_MANIFEST_DIR/witx/preview1/wasi_snapshot_preview1.witx"],
         target: super,
         block_on[in_tokio]: {
             wasi_snapshot_preview1::{
@@ -1428,6 +1428,7 @@ impl<
                 position,
             }) if t.view.table().get(fd)?.is_file() => {
                 let fd = fd.borrowed();
+                let fd2 = fd.borrowed();
                 let blocking_mode = *blocking_mode;
                 let position = position.clone();
                 let append = *append;
@@ -1452,7 +1453,10 @@ impl<
                     (stream, pos)
                 };
                 let n = blocking_mode.write(self, stream, &buf).await?;
-                if !append {
+                if append {
+                    let len = self.stat(fd2).await?;
+                    position.store(len.size, Ordering::Relaxed);
+                } else {
                     let pos = pos.checked_add(n as u64).ok_or(types::Errno::Overflow)?;
                     position.store(pos, Ordering::Relaxed);
                 }
@@ -1565,7 +1569,9 @@ impl<
         let position = position.clone();
         drop(t);
         let pos = match whence {
-            types::Whence::Set if offset >= 0 => offset as _,
+            types::Whence::Set if offset >= 0 => {
+                offset.try_into().map_err(|_| types::Errno::Inval)?
+            }
             types::Whence::Cur => position
                 .load(Ordering::Relaxed)
                 .checked_add_signed(offset)

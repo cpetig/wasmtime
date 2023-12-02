@@ -13,6 +13,9 @@ edition.workspace = true
 default-run = "wasmtime"
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 doctest = false
 
@@ -54,6 +57,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, optional = true, features = [ "signal", "macros" ] }
 hyper = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -85,6 +89,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 walkdir = { workspace = true }
 test-programs-artifacts = { workspace = true }
+bytesize = "1.3.0"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
@@ -118,6 +123,7 @@ members = [
 ]
 exclude = [
   'crates/wasi-common/WASI/tools/witx-cli',
+  'crates/wasi-common/WASI/tools/witx',
   'docs/rust_wasi_markdown_parser',
 ]
 
@@ -127,7 +133,20 @@ authors = ["The Wasmtime Project Developers"]
 edition = "2021"
 # Wasmtime's current policy is that this number can be no larger than the
 # current stable release of Rust minus 2.
-rust-version = "1.71.0"
+rust-version = "1.72.0"
+
+[workspace.lints.rust]
+# Turn on some lints which are otherwise allow-by-default in rustc.
+unused_extern_crates = 'warn'
+trivial_numeric_casts = 'warn'
+unstable_features = 'warn'
+unused_import_braces = 'warn'
+
+[workspace.lints.clippy]
+# The default set of lints in Clippy is viewed as "too noisy" right now so
+# they're all turned off by default. Selective lints are then enabled below as
+# necessary.
+all = 'allow'
 
 [workspace.dependencies]
 arbitrary = { version = "1.3.1" }
@@ -209,18 +228,18 @@ io-extras = "0.18.0"
 rustix = "0.38.21"
 is-terminal = "0.4.0"
 # wit-bindgen:
-wit-bindgen = { version = "0.13.1", default-features = false }
+wit-bindgen = { version = "0.15.0", default-features = false }
 
 # wasm-tools family:
-wasmparser = "0.116.0"
-wat = "1.0.79"
-wast = "67.0.1"
-wasmprinter = "0.2.72"
-wasm-encoder = "0.36.2"
-wasm-smith = "0.12.23"
-wasm-mutate = "0.2.40"
+wasmparser = "0.118.1"
+wat = "1.0.82"
+wast = "69.0.1"
+wasmprinter = "0.2.75"
+wasm-encoder = "0.38.1"
+wasm-smith = "0.13.1"
+wasm-mutate = "0.2.42"
 wit-parser = "0.13.0"
-wit-component = "0.18.0"
+wit-component = "0.19.0"
 
 # Non-Bytecode Alliance maintained dependencies:
 # --------------------------
@@ -255,10 +274,10 @@ filecheck = "0.5.0"
 libc = "0.2.60"
 file-per-thread-logger = "0.2.0"
 tokio = { version = "1.26.0", features = [ "rt", "time" ] }
-hyper = "=1.0.0-rc.3"
-http = "0.2.9"
-http-body = "=1.0.0-rc.2"
-http-body-util = "=0.1.0-rc.2"
+hyper = "1.0.1"
+http = "1.0.0"
+http-body = "1.0.0"
+http-body-util = "0.1.0"
 bytes = "1.4"
 futures = { version = "0.3.27", default-features = false }
 indexmap = "2.0.0"
@@ -359,7 +378,7 @@ old-cli = []
 
 # CLI subcommands for the `wasmtime` executable. See `wasmtime $cmd --help`
 # for more information on each subcommand.
-serve = ["wasi-http", "component-model", "dep:http-body-util"]
+serve = ["wasi-http", "component-model", "dep:http-body-util", "dep:http"]
 explore = ["dep:wasmtime-explorer"]
 wast = ["dep:wasmtime-wast"]
 config = ["cache"]

@@ -14,8 +14,10 @@ use wasmtime::{Engine, Store, StoreLimits};
 use wasmtime_wasi::preview2::{
     self, StreamError, StreamResult, Table, WasiCtx, WasiCtxBuilder, WasiView,
 };
+use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{
-    body::HyperOutgoingBody, hyper_response_error, WasiHttpCtx, WasiHttpView,
+    bindings::http::types as http_types, body::HyperOutgoingBody, hyper_response_error,
+    WasiHttpCtx, WasiHttpView,
 };
 
 #[cfg(feature = "wasi-nn")]
@@ -200,17 +202,39 @@ impl ServeCommand {
     }
 
     fn add_to_linker(&self, linker: &mut Linker<Host>) -> Result<()> {
-        // wasi-http and the component model are implicitly enabled for `wasmtime serve`, so we
-        // don't test for `self.run.common.wasi.common` or `self.run.common.wasi.http` in this
-        // function.
-
-        wasmtime_wasi_http::proxy::add_to_linker(linker)?;
+        // Repurpose the `-Scommon` flag of `wasmtime run` for `wasmtime serve`
+        // to serve as a signal to enable all WASI interfaces instead of just
+        // those in the `proxy` world. If `-Scommon` is present then add all
+        // `command` APIs which includes all "common" or base WASI APIs and then
+        // additionally add in the required HTTP APIs.
+        //
+        // If `-Scommon` isn't passed then use the `proxy::add_to_linker`
+        // bindings which adds just those interfaces that the proxy interface
+        // uses.
+        if self.run.common.wasi.common == Some(true) {
+            preview2::command::add_to_linker(linker)?;
+            wasmtime_wasi_http::proxy::add_only_http_to_linker(linker)?;
+        } else {
+            wasmtime_wasi_http::proxy::add_to_linker(linker)?;
+        }
 
         if self.run.common.wasi.nn == Some(true) {
+            #[cfg(not(feature = "wasi-nn"))]
+            {
+                bail!("support for wasi-nn was disabled at compile time");
+            }
             #[cfg(feature = "wasi-nn")]
             {
                 wasmtime_wasi_nn::wit::ML::add_to_linker(linker, |host| host.nn.as_mut().unwrap())?;
             }
+        }
+
+        if self.run.common.wasi.threads == Some(true) {
+            bail!("support for wasi-threads is not available with components");
+        }
+
+        if self.run.common.wasi.http == Some(false) {
+            bail!("support for wasi-http must be enabled for `serve` subcommand");
         }
 
         Ok(())
@@ -266,6 +290,7 @@ impl ServeCommand {
 
         loop {
             let (stream, _) = listener.accept().await?;
+            let stream = TokioIo::new(stream);
             let h = handler.clone();
             tokio::task::spawn(async move {
                 if let Err(e) = http1::Builder::new()
@@ -346,7 +371,7 @@ impl hyper::service::Service<Request> for ProxyHandler {
     type Error = anyhow::Error;
     type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Response>> + Send>>;
 
-    fn call(&mut self, req: Request) -> Self::Future {
+    fn call(&self, req: Request) -> Self::Future {
         use http_body_util::BodyExt;
 
         let ProxyHandler(inner) = self.clone();
@@ -356,6 +381,37 @@ impl hyper::service::Service<Request> for ProxyHandler {
         // TODO: need to track the join handle, but don't want to block the response on it
         tokio::task::spawn(async move {
             let req_id = inner.next_req_id();
+            let (mut parts, body) = req.into_parts();
+
+            parts.uri = {
+                let uri_parts = parts.uri.into_parts();
+
+                let scheme = uri_parts.scheme.unwrap_or(http::uri::Scheme::HTTP);
+
+                let host = if let Some(val) = parts.headers.get(hyper::header::HOST) {
+                    std::str::from_utf8(val.as_bytes())
+                        .map_err(|_| http_types::ErrorCode::HttpRequestUriInvalid)?
+                } else {
+                    uri_parts
+                        .authority
+                        .as_ref()
+                        .ok_or(http_types::ErrorCode::HttpRequestUriInvalid)?
+                        .host()
+                };
+
+                let path_with_query = uri_parts
+                    .path_and_query
+                    .ok_or(http_types::ErrorCode::HttpRequestUriInvalid)?;
+
+                hyper::Uri::builder()
+                    .scheme(scheme)
+                    .authority(host)
+                    .path_and_query(path_with_query)
+                    .build()
+                    .map_err(|_| http_types::ErrorCode::HttpRequestUriInvalid)?
+            };
+
+            let req = hyper::Request::from_parts(parts, body.map_err(hyper_response_error).boxed());
 
             log::info!(
                 "Request {req_id} handling {} to {}",
@@ -365,10 +421,7 @@ impl hyper::service::Service<Request> for ProxyHandler {
 
             let mut store = inner.cmd.new_store(&inner.engine, req_id)?;
 
-            let req = store
-                .data_mut()
-                .new_incoming_request(req.map(|body| body.map_err(hyper_response_error).boxed()))?;
-
+            let req = store.data_mut().new_incoming_request(req)?;
             let out = store.data_mut().new_response_outparam(sender)?;
 
             let (proxy, _inst) =

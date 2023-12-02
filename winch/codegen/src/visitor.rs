@@ -925,6 +925,14 @@ where
     }
 
     fn visit_call_indirect(&mut self, type_index: u32, table_index: u32, _: u8) {
+        // Spill now because `emit_lazy_init_funcref` and the `FnCall::emit`
+        // invocations will both trigger spills since they both call functions.
+        // However, the machine instructions for the spill emitted by
+        // `emit_lazy_funcref` will be jumped over if the funcref was previously
+        // initialized which may result in the machine stack becoming
+        // unbalanced.
+        self.context.spill(self.masm);
+
         let type_index = TypeIndex::from_u32(type_index);
         let table_index = TableIndex::from_u32(table_index);
 
@@ -1181,14 +1189,31 @@ where
             self.context.pop_to_reg(self.masm, None)
         };
 
-        self.masm.branch(
-            IntCmpKind::Ne,
-            top.reg.into(),
-            top.reg.into(),
-            *frame.label(),
-            OperandSize::S32,
-        );
+        // Emit instructions to balance the machine stack if the frame has
+        // a different offset.
+        let current_sp_offset = self.masm.sp_offset();
+        let (_, frame_sp_offset) = frame.base_stack_len_and_sp();
+        let (label, cmp, needs_cleanup) = if current_sp_offset > frame_sp_offset {
+            (self.masm.get_label(), IntCmpKind::Eq, true)
+        } else {
+            (*frame.label(), IntCmpKind::Ne, false)
+        };
+
+        self.masm
+            .branch(cmp, top.reg.into(), top.reg.into(), label, OperandSize::S32);
         self.context.free_reg(top);
+
+        if needs_cleanup {
+            // Emit instructions to balance the stack and jump if not falling
+            // through.
+            self.masm.ensure_sp_for_jump(frame_sp_offset);
+            self.masm.jmp(*frame.label());
+
+            // Restore sp_offset to what it was for falling through and emit
+            // fallthrough label.
+            self.masm.reset_stack_pointer(current_sp_offset);
+            self.masm.bind(label);
+        }
     }
 
     fn visit_br_table(&mut self, targets: BrTable<'a>) {

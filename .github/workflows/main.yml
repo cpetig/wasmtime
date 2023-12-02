@@ -55,6 +55,22 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
 
+  # Check Code style quickly by running `clang-format` over all the C/C++ code
+  clangformat:
+    name: Clang format
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        submodules: true
+    - run: git ls-files '*.h' '*.c' '*.cpp' | xargs clang-format-15 --dry-run --Werror --verbose
+
+    # common logic to cancel the entire run if this job fails
+    - run: gh run cancel ${{ github.run_id }}
+      if: failure() && github.event_name != 'pull_request'
+      env:
+        GH_TOKEN: ${{ github.token }}
+
   # Lint dependency graph for security advisories, duplicate versions, and
   # incompatible licences
   cargo_deny:
@@ -316,6 +332,10 @@ jobs:
     - run: cargo install --root ${{ runner.tool_cache }}/cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} cargo-ndk
     - run: cargo ndk -t arm64-v8a check -p wasmtime
 
+    # Run clippy configuration
+    - run: rustup component add clippy
+    - run: cargo clippy --workspace
+
     # common logic to cancel the entire run if this job fails
     - run: gh run cancel ${{ github.run_id }}
       if: failure() && github.event_name != 'pull_request'
@@ -470,6 +490,19 @@ jobs:
     - name: Check that the wasi and wasi-http wit directories agree
       run: |
         diff -ru crates/wasi/wit crates/wasi-http/wit
+
+    # Record some CPU details; this is helpful information if tests fail due
+    # to CPU-specific features.
+    - name: CPU information
+      run: lscpu
+      if: matrix.os == 'ubuntu-latest'
+    - name: CPU information
+      run: sysctl hw
+      if: matrix.os == 'macos-latest'
+    - name: CPU information
+      run: wmic cpu list /format:list
+      shell: pwsh
+      if: matrix.os == 'windows-latest'
 
     # Build and test all features
     - run: ./ci/run-tests.sh --locked

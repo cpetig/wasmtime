@@ -155,6 +155,14 @@ impl Val {
         }
     }
 
+    /// Check whether the value is a constant.
+    pub fn is_const(&self) -> bool {
+        match *self {
+            Val::I32(_) | Val::I64(_) | Val::F32(_) | Val::F64(_) => true,
+            _ => false,
+        }
+    }
+
     /// Check whether the value is local with a particular index.
     pub fn is_local_at_index(&self, index: u32) -> bool {
         match *self {
@@ -371,6 +379,18 @@ impl Stack {
     /// Get a mutable reference to the inner stack representation.
     pub fn inner_mut(&mut self) -> &mut VecDeque<Val> {
         &mut self.inner
+    }
+
+    /// Calculates the size of, in bytes, of the top n [Memory] entries
+    /// in the value stack.
+    pub fn sizeof(&self, top: usize) -> u32 {
+        self.peekn(top).fold(0, |acc, v| {
+            if v.is_mem() {
+                acc + v.unwrap_mem().slot.size
+            } else {
+                acc
+            }
+        })
     }
 }
 
