@@ -65,7 +65,7 @@ pub mod bindings {
     #[cfg(feature = "reactor")]
     wit_bindgen::generate!({
         path: "../wasi/wit",
-        world: "wasi:cli/reactor",
+        world: "wasi:cli/imports",
         std_feature,
         raw_strings,
         // Automatically generated bindings for these functions will allocate
@@ -87,9 +87,9 @@ pub mod bindings {
                 import wasi:clocks/wall-clock@0.2.0-rc-2023-11-10;
                 import wasi:clocks/monotonic-clock@0.2.0-rc-2023-11-10;
                 import wasi:random/random@0.2.0-rc-2023-11-10;
-                import wasi:cli/stdout@0.2.0-rc-2023-11-10;
-                import wasi:cli/stderr@0.2.0-rc-2023-11-10;
-                import wasi:cli/stdin@0.2.0-rc-2023-11-10;
+                import wasi:cli/stdout@0.2.0-rc-2023-12-05;
+                import wasi:cli/stderr@0.2.0-rc-2023-12-05;
+                import wasi:cli/stdin@0.2.0-rc-2023-12-05;
             }
         "#,
         std_feature,
@@ -98,7 +98,7 @@ pub mod bindings {
     });
 }
 
-#[export_name = "wasi:cli/run@0.2.0-rc-2023-11-10#run"]
+#[export_name = "wasi:cli/run@0.2.0-rc-2023-12-05#run"]
 #[cfg(feature = "command")]
 pub unsafe extern "C" fn run() -> u32 {
     extern "C" {
@@ -142,6 +142,26 @@ impl<T, E> TrappingUnwrap<T> for Result<T, E> {
             Err(_) => unreachable!(),
         }
     }
+}
+
+/// Allocate a file descriptor which will generate an `ERRNO_BADF` if passed to
+/// any WASI Preview 1 function implemented by this adapter.
+///
+/// This is intended for use by `wasi-libc` during its incremental transition
+/// from WASI Preview 1 to Preview 2.  It will use this function to reserve
+/// descriptors for its own use, valid only for use with libc functions.
+#[no_mangle]
+pub unsafe extern "C" fn adapter_open_badfd(fd: *mut u32) -> Errno {
+    State::with(|state| {
+        *fd = state.descriptors_mut().open(Descriptor::Bad)?;
+        Ok(())
+    })
+}
+
+/// Close a descriptor previously opened using `adapter_open_badfd`.
+#[no_mangle]
+pub unsafe extern "C" fn adapter_close_badfd(fd: u32) -> Errno {
+    State::with(|state| state.descriptors_mut().close(fd))
 }
 
 #[no_mangle]
@@ -533,6 +553,10 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_allocate(
 #[no_mangle]
 pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_close(fd: Fd) -> Errno {
     State::with(|state| {
+        if let Descriptor::Bad = state.descriptors().get(fd)? {
+            return Err(wasi::ERRNO_BADF);
+        }
+
         // If there's a dirent cache entry for this file descriptor then drop
         // it since the descriptor is being closed and future calls to
         // `fd_readdir` should return an error.
@@ -680,7 +704,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_fdstat_get(
                     });
                     Ok(())
                 }
-                Descriptor::Closed(_) => Err(ERRNO_BADF),
+                Descriptor::Closed(_) | Descriptor::Bad => Err(ERRNO_BADF),
             }
         })
     }
@@ -730,7 +754,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_fdstat_set_rights(
         let ds = state.descriptors();
         match ds.get(fd)? {
             Descriptor::Streams(..) => Ok(()),
-            Descriptor::Closed(..) => Err(wasi::ERRNO_BADF),
+            Descriptor::Closed(..) | Descriptor::Bad => Err(wasi::ERRNO_BADF),
         }
     })
 }
@@ -1055,7 +1079,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_read(
                 forget(data);
                 Ok(())
             }
-            Descriptor::Closed(_) => Err(ERRNO_BADF),
+            Descriptor::Closed(_) | Descriptor::Bad => Err(ERRNO_BADF),
         }
     })
 }
@@ -1476,7 +1500,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_write(
                 *nwritten = nbytes;
                 Ok(())
             }
-            Descriptor::Closed(_) => Err(ERRNO_BADF),
+            Descriptor::Closed(_) | Descriptor::Bad => Err(ERRNO_BADF),
         }
     })
 }
@@ -2678,7 +2702,7 @@ impl State {
     #[cfg(not(feature = "proxy"))]
     fn get_environment(&self) -> &[StrTuple] {
         if self.env_vars.get().is_none() {
-            #[link(wasm_import_module = "wasi:cli/environment@0.2.0-rc-2023-11-10")]
+            #[link(wasm_import_module = "wasi:cli/environment@0.2.0-rc-2023-12-05")]
             extern "C" {
                 #[link_name = "get-environment"]
                 fn get_environment_import(rval: *mut StrTupleList);
@@ -2703,7 +2727,7 @@ impl State {
     #[cfg(not(feature = "proxy"))]
     fn get_args(&self) -> &[WasmStr] {
         if self.args.get().is_none() {
-            #[link(wasm_import_module = "wasi:cli/environment@0.2.0-rc-2023-11-10")]
+            #[link(wasm_import_module = "wasi:cli/environment@0.2.0-rc-2023-12-05")]
             extern "C" {
                 #[link_name = "get-arguments"]
                 fn get_args_import(rval: *mut WasmStrList);
