@@ -173,7 +173,7 @@ pub unsafe extern "C" fn reset_adapter_state() {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn cabi_import_realloc(
+pub unsafe extern "C" fn cabi_realloc(
     old_ptr: *mut u8,
     old_size: usize,
     align: usize,
@@ -282,7 +282,7 @@ impl ImportAlloc {
         } else {
             let buffer = self.buffer.get();
             if buffer.is_null() {
-                unreachable!("buffer not provided, or already used")
+                unsafe { malloc(size) }.cast()
             }
             let buffer = buffer as usize;
             let alloc = align_to(buffer, align);
@@ -305,7 +305,7 @@ impl ImportAlloc {
 /// (ish) limit. That's just an implementation limit though which can be lifted
 /// by dynamically calling the main module's allocator as necessary for more data.
 #[no_mangle]
-pub unsafe extern "C" fn cabi_realloc(
+pub unsafe extern "C" fn cabi_export_realloc(
     old_ptr: *mut u8,
     old_size: usize,
     align: usize,
