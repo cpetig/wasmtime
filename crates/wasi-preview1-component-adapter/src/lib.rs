@@ -282,7 +282,7 @@ impl ImportAlloc {
         } else {
             let buffer = self.buffer.get();
             if buffer.is_null() {
-                unsafe { malloc(size) }.cast()
+                return unsafe { malloc(size) }.cast();
             }
             let buffer = buffer as usize;
             let alloc = align_to(buffer, align);
