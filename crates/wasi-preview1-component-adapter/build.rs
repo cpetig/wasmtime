@@ -2,6 +2,10 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    // for adapter .wasm only
+    if std::env::var("CARGO_FEATURE_ADAPTER").is_err() {
+        return;
+    }
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     let wasm = build_raw_intrinsics();
