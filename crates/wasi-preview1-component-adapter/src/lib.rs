@@ -101,6 +101,7 @@ pub mod bindings {
 #[export_name = "wasi:cli/run@0.2.0-rc-2023-12-05#run"]
 #[cfg(feature = "command")]
 pub unsafe extern "C" fn run() -> u32 {
+    #[cfg_attr(feature = "adapter", link(wasm_import_module = "__main_module__"))]
     extern "C" {
         fn _start();
     }
@@ -172,8 +173,31 @@ pub unsafe extern "C" fn reset_adapter_state() {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn cabi_realloc(
+cfg_if::cfg_if! {
+    if #[cfg(feature = "adapter")] {
+        #[no_mangle]
+        pub unsafe extern "C" fn cabi_import_realloc(
+            old_ptr: *mut u8,
+            old_size: usize,
+            align: usize,
+            new_size: usize,
+        ) -> *mut u8 {
+            import_realloc(old_ptr, old_size, align, new_size)
+        }
+    } else {
+        #[no_mangle]
+        pub unsafe extern "C" fn cabi_realloc(
+            old_ptr: *mut u8,
+            old_size: usize,
+            align: usize,
+            new_size: usize,
+        ) -> *mut u8 {
+            import_realloc(old_ptr, old_size, align, new_size)
+        }
+    }
+}
+
+unsafe fn import_realloc(
     old_ptr: *mut u8,
     old_size: usize,
     align: usize,
@@ -190,8 +214,23 @@ pub unsafe extern "C" fn cabi_realloc(
     ptr
 }
 
-extern "C" {
-    fn malloc(size: usize) -> *mut ();
+cfg_if::cfg_if! {
+    if #[cfg(feature = "adapter")] {
+        unsafe fn alloc(align: usize, new_len: usize) -> *mut () {
+            #[link(wasm_import_module = "__main_module__")]
+            extern "C" {
+                fn cabi_realloc(old_ptr: *mut u8, old_len: usize, align: usize, new_len: usize) -> *mut u8;
+            }
+            cabi_realloc(std::ptr::null_mut(), 0, align, new_len).cast()
+        }
+    } else {
+        unsafe fn alloc(_align: usize, new_len: usize) -> *mut () {
+            extern "C" {
+                fn malloc(size: usize) -> *mut ();
+            }
+            malloc(new_len).cast()
+        }
+    }
 }
 
 /// Bump-allocated memory arena. This is a singleton - the
@@ -208,8 +247,8 @@ impl BumpArena {
             _position: Cell::new(0),
         }
     }
-    fn alloc(&self, _align: usize, size: usize) -> *mut u8 {
-        unsafe { malloc(size) }.cast()
+    fn alloc(&self, align: usize, size: usize) -> *mut u8 {
+        unsafe { alloc(align, size) }.cast()
     }
 }
 fn align_to(ptr: usize, align: usize) -> usize {
@@ -282,7 +321,7 @@ impl ImportAlloc {
         } else {
             let buffer = self.buffer.get();
             if buffer.is_null() {
-                return unsafe { malloc(size) }.cast();
+                return unsafe { alloc(align, size) }.cast();
             }
             let buffer = buffer as usize;
             let alloc = align_to(buffer, align);
@@ -2583,20 +2622,32 @@ enum AllocationState {
     StateAllocated,
 }
 
-static mut STATE_PTR: *mut State = null_mut();
-static mut ALLOC_STATE: AllocationState = AllocationState::StackAllocated;
+cfg_if::cfg_if! {
+    if #[cfg(feature = "adapter")] {
+        #[allow(improper_ctypes)]
+        extern "C" {
+            fn get_state_ptr() -> *mut State;
+            fn set_state_ptr(state: *mut State);
+            fn get_allocation_state() -> AllocationState;
+            fn set_allocation_state(state: AllocationState);
+        }
+    } else {
+        static mut STATE_PTR: *mut State = null_mut();
+        static mut ALLOC_STATE: AllocationState = AllocationState::StackAllocated;
 
-unsafe fn get_state_ptr() -> *mut State {
-    STATE_PTR
-}
-unsafe fn set_state_ptr(state: *mut State) {
-    STATE_PTR = state;
-}
-unsafe fn get_allocation_state() -> AllocationState {
-    ALLOC_STATE
-}
-unsafe fn set_allocation_state(state: AllocationState) {
-    ALLOC_STATE = state;
+        unsafe fn get_state_ptr() -> *mut State {
+            STATE_PTR
+        }
+        unsafe fn set_state_ptr(state: *mut State) {
+            STATE_PTR = state;
+        }
+        unsafe fn get_allocation_state() -> AllocationState {
+            ALLOC_STATE
+        }
+        unsafe fn set_allocation_state(state: AllocationState) {
+            ALLOC_STATE = state;
+        }
+    }
 }
 
 impl State {
@@ -2631,7 +2682,12 @@ impl State {
 
         unsafe { set_allocation_state(AllocationState::StateAllocating) };
 
-        let ret = unsafe { malloc(mem::size_of::<UnsafeCell<State>>()) as *mut State };
+        let ret = unsafe {
+            alloc(
+                mem::align_of::<UnsafeCell<State>>(),
+                mem::size_of::<UnsafeCell<State>>(),
+            ) as *mut State
+        };
         assert!(ret != null_mut());
 
         unsafe { set_allocation_state(AllocationState::StateAllocated) };
@@ -2759,4 +2815,380 @@ pub unsafe extern "C" fn __imported_wasi_thread_spawn(arg: u32) -> i32 {
         fn thread_spawn(arg: u32) -> i32;
     }
     thread_spawn(arg)
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "adapter")] {
+        #[no_mangle]
+        pub unsafe extern "C" fn args_get(argv: *mut *mut u8, argv_buf: *mut u8) -> Errno {
+            __imported_wasi_snapshot_preview1_args_get(argv, argv_buf)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn args_sizes_get(argc: *mut Size, argv_buf_size: *mut Size) -> Errno {
+            __imported_wasi_snapshot_preview1_args_sizes_get(argc, argv_buf_size)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn environ_get(environ: *mut *mut u8, environ_buf: *mut u8) -> Errno {
+            __imported_wasi_snapshot_preview1_environ_get(environ, environ_buf)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn environ_sizes_get(
+            environc: *mut Size,
+            environ_buf_size: *mut Size,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_environ_sizes_get(environc, environ_buf_size)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn clock_time_get(
+            id: Clockid,
+            _precision: Timestamp,
+            time: &mut Timestamp,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_clock_time_get(id, _precision, time)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_advise(
+            fd: Fd,
+            offset: Filesize,
+            len: Filesize,
+            advice: Advice,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_advise(fd, offset, len, advice)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_allocate(fd: Fd, _offset: Filesize, _len: Filesize) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_allocate(fd, _offset, _len)
+        }
+        
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_close(fd: Fd) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_close(fd)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_datasync(fd: Fd) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_datasync(fd)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_fdstat_get(fd: Fd, stat: *mut Fdstat) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_fdstat_get(fd, stat)
+        }
+        
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_fdstat_set_flags(fd: Fd, flags: Fdflags) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_fdstat_set_flags(fd, flags)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_fdstat_set_rights(
+            fd: Fd,
+            _fs_rights_base: Rights,
+            _fs_rights_inheriting: Rights,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_fdstat_set_rights(
+                fd,
+                _fs_rights_base,
+                _fs_rights_inheriting,
+            )
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_filestat_get(fd: Fd, buf: *mut Filestat) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_filestat_get(fd, buf)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_filestat_set_size(fd: Fd, size: Filesize) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_filestat_set_size(fd, size)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_filestat_set_times(
+            fd: Fd,
+            atim: Timestamp,
+            mtim: Timestamp,
+            fst_flags: Fstflags,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_filestat_set_times(fd, atim, mtim, fst_flags)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_pread(
+            fd: Fd,
+            iovs_ptr: *const Iovec,
+            iovs_len: usize,
+            offset: Filesize,
+            nread: *mut Size,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_pread(fd, iovs_ptr, iovs_len, offset, nread)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_prestat_get(fd: Fd, buf: *mut Prestat) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_prestat_get(fd, buf)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_prestat_dir_name(fd: Fd, path: *mut u8, path_max_len: Size) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_prestat_dir_name(fd, path, path_max_len)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_pwrite(
+            fd: Fd,
+            iovs_ptr: *const Ciovec,
+            iovs_len: usize,
+            offset: Filesize,
+            nwritten: *mut Size,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_pwrite(fd, iovs_ptr, iovs_len, offset, nwritten)
+        }
+        
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_read(
+            fd: Fd,
+            iovs_ptr: *const Iovec,
+            iovs_len: usize,
+            nread: *mut Size,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_read(fd, iovs_ptr, iovs_len, nread)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_readdir(
+            fd: Fd,
+            buf: *mut u8,
+            buf_len: Size,
+            cookie: Dircookie,
+            bufused: *mut Size,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_readdir(fd, buf, buf_len, cookie, bufused)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_renumber(fd: Fd, to: Fd) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_renumber(fd, to)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_seek(
+            fd: Fd,
+            offset: Filedelta,
+            whence: Whence,
+            newoffset: *mut Filesize,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_seek(fd, offset, whence, newoffset)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_sync(fd: Fd) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_sync(fd)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_tell(fd: Fd, offset: *mut Filesize) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_tell(fd, offset)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn fd_write(
+            fd: Fd,
+            iovs_ptr: *const Ciovec,
+            iovs_len: usize,
+            nwritten: *mut Size,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_fd_write(fd, iovs_ptr, iovs_len, nwritten)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_create_directory(
+            fd: Fd,
+            path_ptr: *const u8,
+            path_len: usize,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_path_create_directory(fd, path_ptr, path_len)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_filestat_get(
+            fd: Fd,
+            flags: Lookupflags,
+            path_ptr: *const u8,
+            path_len: usize,
+            buf: *mut Filestat,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_path_filestat_get(fd, flags, path_ptr, path_len, buf)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_filestat_set_times(
+            fd: Fd,
+            flags: Lookupflags,
+            path_ptr: *const u8,
+            path_len: usize,
+            atim: Timestamp,
+            mtim: Timestamp,
+            fst_flags: Fstflags,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_path_filestat_set_times(
+                fd, flags, path_ptr, path_len, atim, mtim, fst_flags,
+            )
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_link(
+            old_fd: Fd,
+            old_flags: Lookupflags,
+            old_path_ptr: *const u8,
+            old_path_len: usize,
+            new_fd: Fd,
+            new_path_ptr: *const u8,
+            new_path_len: usize,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_path_link(
+                old_fd,
+                old_flags,
+                old_path_ptr,
+                old_path_len,
+                new_fd,
+                new_path_ptr,
+                new_path_len,
+            )
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_open(
+            fd: Fd,
+            dirflags: Lookupflags,
+            path_ptr: *const u8,
+            path_len: usize,
+            oflags: Oflags,
+            fs_rights_base: Rights,
+            fs_rights_inheriting: Rights,
+            fdflags: Fdflags,
+            opened_fd: *mut Fd,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_path_open(
+                fd,
+                dirflags,
+                path_ptr,
+                path_len,
+                oflags,
+                fs_rights_base,
+                fs_rights_inheriting,
+                fdflags,
+                opened_fd,
+            )
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_readlink(
+            fd: Fd,
+            path_ptr: *const u8,
+            path_len: usize,
+            buf: *mut u8,
+            buf_len: Size,
+            bufused: *mut Size,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_path_readlink(fd, path_ptr, path_len, buf, buf_len, bufused)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_remove_directory(
+            fd: Fd,
+            path_ptr: *const u8,
+            path_len: usize,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_path_remove_directory(fd, path_ptr, path_len)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_rename(
+            old_fd: Fd,
+            old_path_ptr: *const u8,
+            old_path_len: usize,
+            new_fd: Fd,
+            new_path_ptr: *const u8,
+            new_path_len: usize,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_path_rename(
+                old_fd,
+                old_path_ptr,
+                old_path_len,
+                new_fd,
+                new_path_ptr,
+                new_path_len,
+            )
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_symlink(
+            old_path_ptr: *const u8,
+            old_path_len: usize,
+            fd: Fd,
+            new_path_ptr: *const u8,
+            new_path_len: usize,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_path_symlink(
+                old_path_ptr,
+                old_path_len,
+                fd,
+                new_path_ptr,
+                new_path_len,
+            )
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn path_unlink_file(fd: Fd, path_ptr: *const u8, path_len: usize) -> Errno {
+            __imported_wasi_snapshot_preview1_path_unlink_file(fd, path_ptr, path_len)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn poll_oneoff(
+            r#in: *const Subscription,
+            out: *mut Event,
+            nsubscriptions: Size,
+            nevents: *mut Size,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_poll_oneoff(r#in, out, nsubscriptions, nevents)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn proc_exit(rval: Exitcode) -> ! {
+            __imported_wasi_snapshot_preview1_proc_exit(rval)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn proc_raise(_sig: Signal) -> Errno {
+            __imported_wasi_snapshot_preview1_proc_raise(_sig)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn sched_yield() -> Errno {
+            __imported_wasi_snapshot_preview1_sched_yield()
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn random_get(buf: *mut u8, buf_len: Size) -> Errno {
+            __imported_wasi_snapshot_preview1_random_get(buf, buf_len)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn sock_accept(_fd: Fd, _flags: Fdflags, _connection: *mut Fd) -> Errno {
+            __imported_wasi_snapshot_preview1_sock_accept(_fd, _flags, _connection)
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn sock_recv(
+            _fd: Fd,
+            _ri_data_ptr: *const Iovec,
+            _ri_data_len: usize,
+            _ri_flags: Riflags,
+            _ro_datalen: *mut Size,
+            _ro_flags: *mut Roflags,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_sock_recv(
+                _fd,
+                _ri_data_ptr,
+                _ri_data_len,
+                _ri_flags,
+                _ro_datalen,
+                _ro_flags,
+            )
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn sock_send(
+            _fd: Fd,
+            _si_data_ptr: *const Ciovec,
+            _si_data_len: usize,
+            _si_flags: Siflags,
+            _so_datalen: *mut Size,
+        ) -> Errno {
+            __imported_wasi_snapshot_preview1_sock_send(
+                _fd,
+                _si_data_ptr,
+                _si_data_len,
+                _si_flags,
+                _so_datalen,
+            )
+        }
+        #[no_mangle]
+        pub unsafe extern "C" fn sock_shutdown(_fd: Fd, _how: Sdflags) -> Errno {
+            __imported_wasi_snapshot_preview1_sock_shutdown(_fd, _how)
+        }
+        
+        #[no_mangle]
+        pub unsafe extern "C" fn wasi_thread_spawn(arg: u32) -> i32 {
+            __imported_wasi_thread_spawn(arg)
+        }  
+
+    }
 }
