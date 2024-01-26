@@ -4,7 +4,7 @@ CFLAGS=--target=wasm32-wasi -O3 -mbulk-memory -mextended-const -msign-ext
 all: component2_r.wasm
 
 test_r.wasm: main.c
-	$(CC) $(CFLAGS) -s -o $@ $^ -lc -L../../target/wasm32-unknown-unknown/release -lwasi_snapshot_preview1 '-Wl,--export=wasi:cli/run@0.2.0-rc-2023-11-10#run' -Wl,--export=cabi_realloc \
+	$(CC) $(CFLAGS) -s -o $@ $^ -lc -L../../target/wasm32-unknown-unknown/release -lwasi_snapshot_preview1 '-Wl,--export=wasi:cli/run@0.2.0#run' -Wl,--export=cabi_realloc \
 		-Wl,--extra-features=bulk-memory
 
 preview1_r.wasm: main.c
