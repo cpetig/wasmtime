@@ -1,6 +1,7 @@
 use crate::component::func::HostFunc;
 use crate::component::instance::RuntimeImport;
-use crate::component::matching::TypeChecker;
+use crate::component::matching::{InstanceType, TypeChecker};
+use crate::component::types;
 use crate::component::{
     Component, ComponentNamedList, Instance, InstancePre, Lift, Lower, ResourceType, Val,
 };
@@ -14,7 +15,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 use wasmtime_environ::component::TypeDef;
-use wasmtime_environ::PrimaryMap;
+use wasmtime_environ::{EntityRef, PrimaryMap};
 
 /// A type used to instantiate [`Component`]s.
 ///
@@ -27,6 +28,7 @@ pub struct Linker<T> {
     strings: Strings,
     map: NameMap,
     path: Vec<usize>,
+    resource_imports: usize,
     allow_shadowing: bool,
     _marker: marker::PhantomData<fn() -> T>,
 }
@@ -38,6 +40,7 @@ impl<T> Clone for Linker<T> {
             strings: self.strings.clone(),
             map: self.map.clone(),
             path: self.path.clone(),
+            resource_imports: self.resource_imports.clone(),
             allow_shadowing: self.allow_shadowing,
             _marker: self._marker,
         }
@@ -61,8 +64,48 @@ pub struct LinkerInstance<'a, T> {
     path_len: usize,
     strings: &'a mut Strings,
     map: &'a mut NameMap,
+    resource_imports: &'a mut usize,
     allow_shadowing: bool,
     _marker: marker::PhantomData<fn() -> T>,
+}
+
+/// Index correlating a resource definition to the import path.
+/// This is assigned by [`Linker::resource`] and may be used to associate it to
+/// [`RuntimeImportIndex`](wasmtime_environ::component::RuntimeImportIndex)
+/// at a later stage
+///
+/// [`Linker::resource`]: crate::component::LinkerInstance::resource
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResourceImportIndex(usize);
+
+impl EntityRef for ResourceImportIndex {
+    fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl Deref for ResourceImportIndex {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<usize> for ResourceImportIndex {
+    fn from(idx: usize) -> Self {
+        Self(idx)
+    }
+}
+
+impl From<ResourceImportIndex> for usize {
+    fn from(idx: ResourceImportIndex) -> Self {
+        idx.0
+    }
 }
 
 pub(crate) type NameMap = HashMap<usize, Definition>;
@@ -72,7 +115,11 @@ pub(crate) enum Definition {
     Instance(NameMap),
     Func(Arc<HostFunc>),
     Module(Module),
-    Resource(ResourceType, Arc<crate::func::HostFunc>),
+    Resource(
+        ResourceImportIndex,
+        ResourceType,
+        Arc<crate::func::HostFunc>,
+    ),
 }
 
 impl<T> Linker<T> {
@@ -85,6 +132,7 @@ impl<T> Linker<T> {
             map: NameMap::default(),
             allow_shadowing: false,
             path: Vec::new(),
+            resource_imports: 0,
             _marker: marker::PhantomData,
         }
     }
@@ -112,6 +160,7 @@ impl<T> Linker<T> {
             path_len: 0,
             strings: &mut self.strings,
             map: &mut self.map,
+            resource_imports: &mut self.resource_imports,
             allow_shadowing: self.allow_shadowing,
             _marker: self._marker,
         }
@@ -124,6 +173,42 @@ impl<T> Linker<T> {
     /// Returns an error if `name` is already defined within the linker.
     pub fn instance(&mut self, name: &str) -> Result<LinkerInstance<'_, T>> {
         self.root().into_instance(name)
+    }
+
+    fn typecheck<'a>(&'a self, component: &'a Component) -> Result<TypeChecker<'a>> {
+        let mut cx = TypeChecker {
+            component: component.env_component(),
+            types: component.types(),
+            strings: &self.strings,
+            imported_resources: Default::default(),
+        };
+
+        // Walk over the component's list of import names and use that to lookup
+        // the definition within this linker that it corresponds to. When found
+        // perform a typecheck against the component's expected type.
+        let env_component = component.env_component();
+        for (_idx, (name, ty)) in env_component.import_types.iter() {
+            let import = self
+                .strings
+                .lookup(name)
+                .and_then(|name| self.map.get(&name));
+            cx.definition(ty, import)
+                .with_context(|| format!("import `{name}` has the wrong type"))?;
+        }
+        Ok(cx)
+    }
+
+    /// Returns the [`types::Component`] corresponding to `component` with resource
+    /// types imported by it replaced using imports present in [`Self`].
+    pub fn substituted_component_type(&self, component: &Component) -> Result<types::Component> {
+        let cx = self.typecheck(&component)?;
+        Ok(types::Component::from(
+            component.ty(),
+            &InstanceType {
+                types: cx.types,
+                resources: &cx.imported_resources,
+            },
+        ))
     }
 
     /// Performs a "pre-instantiation" to resolve the imports of the
@@ -145,31 +230,15 @@ impl<T> Linker<T> {
     /// `component` imports or if a name defined doesn't match the type of the
     /// item imported by the `component` provided.
     pub fn instantiate_pre(&self, component: &Component) -> Result<InstancePre<T>> {
-        let mut cx = TypeChecker {
-            component: component.env_component(),
-            types: component.types(),
-            strings: &self.strings,
-            imported_resources: Default::default(),
-        };
-
-        // Walk over the component's list of import names and use that to lookup
-        // the definition within this linker that it corresponds to. When found
-        // perform a typecheck against the component's expected type.
-        let env_component = component.env_component();
-        for (_idx, (name, ty)) in env_component.import_types.iter() {
-            let import = self
-                .strings
-                .lookup(name)
-                .and_then(|name| self.map.get(&name));
-            cx.definition(ty, import)
-                .with_context(|| format!("import `{name}` has the wrong type"))?;
-        }
+        self.typecheck(&component)?;
 
         // Now that all imports are known to be defined and satisfied by this
         // linker a list of "flat" import items (aka no instances) is created
         // using the import map within the component created at
         // component-compile-time.
+        let env_component = component.env_component();
         let mut imports = PrimaryMap::with_capacity(env_component.imports.len());
+        let mut resource_imports = PrimaryMap::from(vec![None; self.resource_imports]);
         for (idx, (import, names)) in env_component.imports.iter() {
             let (root, _) = &env_component.import_types[*import];
             let root = self.strings.lookup(root).unwrap();
@@ -188,11 +257,14 @@ impl<T> Linker<T> {
             let import = match cur {
                 Definition::Module(m) => RuntimeImport::Module(m.clone()),
                 Definition::Func(f) => RuntimeImport::Func(f.clone()),
-                Definition::Resource(t, dtor) => RuntimeImport::Resource {
-                    ty: t.clone(),
-                    _dtor: dtor.clone(),
-                    dtor_funcref: component.resource_drop_func_ref(dtor),
-                },
+                Definition::Resource(res_idx, t, dtor) => {
+                    resource_imports[*res_idx] = Some(idx);
+                    RuntimeImport::Resource {
+                        ty: t.clone(),
+                        _dtor: dtor.clone(),
+                        dtor_funcref: component.resource_drop_func_ref(dtor),
+                    }
+                }
 
                 // This is guaranteed by the compilation process that "leaf"
                 // runtime imports are never instances.
@@ -201,7 +273,7 @@ impl<T> Linker<T> {
             let i = imports.push(import);
             assert_eq!(i, idx);
         }
-        Ok(unsafe { InstancePre::new_unchecked(component.clone(), imports) })
+        Ok(unsafe { InstancePre::new_unchecked(component.clone(), imports, resource_imports) })
     }
 
     /// Instantiates the [`Component`] provided into the `store` specified.
@@ -266,6 +338,7 @@ impl<T> LinkerInstance<'_, T> {
             path_len: self.path_len,
             strings: self.strings,
             map: self.map,
+            resource_imports: self.resource_imports,
             allow_shadowing: self.allow_shadowing,
             _marker: self._marker,
         }
@@ -444,13 +517,19 @@ impl<T> LinkerInstance<'_, T> {
         name: &str,
         ty: ResourceType,
         dtor: impl Fn(StoreContextMut<'_, T>, u32) -> Result<()> + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<ResourceImportIndex> {
         let name = self.strings.intern(name);
         let dtor = Arc::new(crate::func::HostFunc::wrap(
             &self.engine,
             move |mut cx: crate::Caller<'_, T>, param: u32| dtor(cx.as_context_mut(), param),
         ));
-        self.insert(name, Definition::Resource(ty, dtor))
+        let idx = ResourceImportIndex::new(*self.resource_imports);
+        *self.resource_imports = self
+            .resource_imports
+            .checked_add(1)
+            .context("resource import count would overflow")?;
+        self.insert(name, Definition::Resource(idx, ty, dtor))?;
+        Ok(idx)
     }
 
     /// Defines a nested instance within this instance.

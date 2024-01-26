@@ -1,6 +1,8 @@
 use crate::component::func::HostFunc;
 use crate::component::matching::InstanceType;
-use crate::component::{Component, ComponentNamedList, Func, Lift, Lower, ResourceType, TypedFunc};
+use crate::component::{
+    Component, ComponentNamedList, Func, Lift, Lower, ResourceImportIndex, ResourceType, TypedFunc,
+};
 use crate::instance::OwnedImports;
 use crate::linker::DefinitionType;
 use crate::store::{StoreOpaque, Stored};
@@ -520,6 +522,7 @@ impl<'a> Instantiator<'a> {
 pub struct InstancePre<T> {
     component: Component,
     imports: Arc<PrimaryMap<RuntimeImportIndex, RuntimeImport>>,
+    resource_imports: Arc<PrimaryMap<ResourceImportIndex, Option<RuntimeImportIndex>>>,
     _marker: marker::PhantomData<fn() -> T>,
 }
 
@@ -529,6 +532,7 @@ impl<T> Clone for InstancePre<T> {
         Self {
             component: self.component.clone(),
             imports: self.imports.clone(),
+            resource_imports: self.resource_imports.clone(),
             _marker: self._marker,
         }
     }
@@ -544,12 +548,26 @@ impl<T> InstancePre<T> {
     pub(crate) unsafe fn new_unchecked(
         component: Component,
         imports: PrimaryMap<RuntimeImportIndex, RuntimeImport>,
+        resource_imports: PrimaryMap<ResourceImportIndex, Option<RuntimeImportIndex>>,
     ) -> InstancePre<T> {
         InstancePre {
             component,
             imports: Arc::new(imports),
+            resource_imports: Arc::new(resource_imports),
             _marker: marker::PhantomData,
         }
+    }
+
+    pub(crate) fn resource_import_index(
+        &self,
+        path: ResourceImportIndex,
+    ) -> Option<RuntimeImportIndex> {
+        *self.resource_imports.get(path)?
+    }
+
+    pub(crate) fn resource_import(&self, path: ResourceImportIndex) -> Option<&RuntimeImport> {
+        let idx = self.resource_import_index(path)?;
+        self.imports.get(idx)
     }
 
     /// Returns the underlying component that will be instantiated.
@@ -696,8 +714,8 @@ impl<'a, 'store> ExportInstance<'a, 'store> {
                 options,
             )),
             Export::ModuleStatic(_)
-            | Export::ModuleImport(_)
-            | Export::Instance(_)
+            | Export::ModuleImport { .. }
+            | Export::Instance { .. }
             | Export::Type(_) => None,
         }
     }
@@ -720,7 +738,7 @@ impl<'a, 'store> ExportInstance<'a, 'store> {
     pub fn module(&mut self, name: &str) -> Option<&'a Module> {
         match self.exports.get(name)? {
             Export::ModuleStatic(idx) => Some(&self.data.component.static_module(*idx)),
-            Export::ModuleImport(idx) => Some(match &self.data.imports[*idx] {
+            Export::ModuleImport { import, .. } => Some(match &self.data.imports[*import] {
                 RuntimeImport::Module(m) => m,
                 _ => unreachable!(),
             }),
@@ -735,8 +753,8 @@ impl<'a, 'store> ExportInstance<'a, 'store> {
             Export::Type(_)
             | Export::LiftedFunction { .. }
             | Export::ModuleStatic(_)
-            | Export::ModuleImport(_)
-            | Export::Instance(_) => None,
+            | Export::ModuleImport { .. }
+            | Export::Instance { .. } => None,
         }
     }
 
@@ -756,7 +774,7 @@ impl<'a, 'store> ExportInstance<'a, 'store> {
         self.exports.iter().filter_map(|(name, export)| {
             let module = match *export {
                 Export::ModuleStatic(idx) => self.data.component.static_module(idx),
-                Export::ModuleImport(idx) => match &self.data.imports[idx] {
+                Export::ModuleImport { import, .. } => match &self.data.imports[import] {
                     RuntimeImport::Module(m) => m,
                     _ => unreachable!(),
                 },
@@ -785,7 +803,7 @@ impl<'a, 'store> ExportInstance<'a, 'store> {
     /// return value with the same lifetimes.
     pub fn into_instance(self, name: &str) -> Option<ExportInstance<'a, 'store>> {
         match self.exports.get(name)? {
-            Export::Instance(exports) => Some(ExportInstance {
+            Export::Instance { exports, .. } => Some(ExportInstance {
                 exports,
                 instance: self.instance,
                 data: self.data,

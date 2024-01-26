@@ -13,7 +13,6 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use io_lifetimes::AsSocketlike;
 use rustix::io::Errno;
-use rustix::net::sockopt;
 use std::net::SocketAddr;
 use tokio::io::Interest;
 use wasmtime::component::Resource;
@@ -33,7 +32,7 @@ impl<T: WasiView> udp::HostUdpSocket for T {
         local_address: IpSocketAddress,
     ) -> SocketResult<()> {
         self.ctx().allowed_network_uses.check_allowed_udp()?;
-        let table = self.table_mut();
+        let table = self.table();
 
         match table.get(&this)?.udp_state {
             UdpState::Default => {}
@@ -55,23 +54,18 @@ impl<T: WasiView> udp::HostUdpSocket for T {
 
         {
             check.check(&local_address, SocketAddrUse::UdpBind)?;
-            let udp_socket = &*socket
-                .udp_socket()
-                .as_socketlike_view::<cap_std::net::UdpSocket>();
 
             // Perform the OS bind call.
-            util::udp_bind(udp_socket, &local_address).map_err(|error| {
-                match Errno::from_io_error(&error) {
-                    // From https://pubs.opengroup.org/onlinepubs/9699919799/functions/bind.html:
-                    // > [EAFNOSUPPORT] The specified address is not a valid address for the address family of the specified socket
-                    //
-                    // The most common reasons for this error should have already
-                    // been handled by our own validation slightly higher up in this
-                    // function. This error mapping is here just in case there is
-                    // an edge case we didn't catch.
-                    Some(Errno::AFNOSUPPORT) => ErrorCode::InvalidArgument,
-                    _ => ErrorCode::from(error),
-                }
+            util::udp_bind(socket.udp_socket(), &local_address).map_err(|error| match error {
+                // From https://pubs.opengroup.org/onlinepubs/9699919799/functions/bind.html:
+                // > [EAFNOSUPPORT] The specified address is not a valid address for the address family of the specified socket
+                //
+                // The most common reasons for this error should have already
+                // been handled by our own validation slightly higher up in this
+                // function. This error mapping is here just in case there is
+                // an edge case we didn't catch.
+                Errno::AFNOSUPPORT => ErrorCode::InvalidArgument,
+                _ => ErrorCode::from(error),
             })?;
         }
 
@@ -82,7 +76,7 @@ impl<T: WasiView> udp::HostUdpSocket for T {
     }
 
     fn finish_bind(&mut self, this: Resource<udp::UdpSocket>) -> SocketResult<()> {
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
 
         match socket.udp_state {
@@ -102,7 +96,7 @@ impl<T: WasiView> udp::HostUdpSocket for T {
         Resource<udp::IncomingDatagramStream>,
         Resource<udp::OutgoingDatagramStream>,
     )> {
-        let table = self.table_mut();
+        let table = self.table();
 
         let has_active_streams = table
             .iter_children(&this)?
@@ -167,8 +161,8 @@ impl<T: WasiView> udp::HostUdpSocket for T {
         };
 
         Ok((
-            self.table_mut().push_child(incoming_stream, &this)?,
-            self.table_mut().push_child(outgoing_stream, &this)?,
+            self.table().push_child(incoming_stream, &this)?,
+            self.table().push_child(outgoing_stream, &this)?,
         ))
     }
 
@@ -214,35 +208,7 @@ impl<T: WasiView> udp::HostUdpSocket for T {
 
         match socket.family {
             SocketAddressFamily::Ipv4 => Ok(IpAddressFamily::Ipv4),
-            SocketAddressFamily::Ipv6 { .. } => Ok(IpAddressFamily::Ipv6),
-        }
-    }
-
-    fn ipv6_only(&mut self, this: Resource<udp::UdpSocket>) -> SocketResult<bool> {
-        let table = self.table();
-        let socket = table.get(&this)?;
-
-        match socket.family {
-            SocketAddressFamily::Ipv4 => Err(ErrorCode::NotSupported.into()),
-            SocketAddressFamily::Ipv6 { v6only } => Ok(v6only),
-        }
-    }
-
-    fn set_ipv6_only(&mut self, this: Resource<udp::UdpSocket>, value: bool) -> SocketResult<()> {
-        let table = self.table_mut();
-        let socket = table.get_mut(&this)?;
-
-        match socket.family {
-            SocketAddressFamily::Ipv4 => Err(ErrorCode::NotSupported.into()),
-            SocketAddressFamily::Ipv6 { .. } => match socket.udp_state {
-                UdpState::Default => {
-                    sockopt::set_ipv6_v6only(socket.udp_socket(), value)?;
-                    socket.family = SocketAddressFamily::Ipv6 { v6only: value };
-                    Ok(())
-                }
-                UdpState::BindStarted => Err(ErrorCode::ConcurrencyConflict.into()),
-                _ => Err(ErrorCode::InvalidState.into()),
-            },
+            SocketAddressFamily::Ipv6 => Ok(IpAddressFamily::Ipv6),
         }
     }
 
@@ -252,7 +218,7 @@ impl<T: WasiView> udp::HostUdpSocket for T {
 
         let ttl = match socket.family {
             SocketAddressFamily::Ipv4 => util::get_ip_ttl(socket.udp_socket())?,
-            SocketAddressFamily::Ipv6 { .. } => util::get_ipv6_unicast_hops(socket.udp_socket())?,
+            SocketAddressFamily::Ipv6 => util::get_ipv6_unicast_hops(socket.udp_socket())?,
         };
 
         Ok(ttl)
@@ -268,9 +234,7 @@ impl<T: WasiView> udp::HostUdpSocket for T {
 
         match socket.family {
             SocketAddressFamily::Ipv4 => util::set_ip_ttl(socket.udp_socket(), value)?,
-            SocketAddressFamily::Ipv6 { .. } => {
-                util::set_ipv6_unicast_hops(socket.udp_socket(), value)?
-            }
+            SocketAddressFamily::Ipv6 => util::set_ipv6_unicast_hops(socket.udp_socket(), value)?,
         }
 
         Ok(())
@@ -319,11 +283,11 @@ impl<T: WasiView> udp::HostUdpSocket for T {
     }
 
     fn subscribe(&mut self, this: Resource<udp::UdpSocket>) -> anyhow::Result<Resource<Pollable>> {
-        crate::preview2::poll::subscribe(self.table_mut(), this)
+        crate::preview2::poll::subscribe(self.table(), this)
     }
 
     fn drop(&mut self, this: Resource<udp::UdpSocket>) -> Result<(), anyhow::Error> {
-        let table = self.table_mut();
+        let table = self.table();
 
         // As in the filesystem implementation, we assume closing a socket
         // doesn't block.
@@ -399,11 +363,11 @@ impl<T: WasiView> udp::HostIncomingDatagramStream for T {
         &mut self,
         this: Resource<udp::IncomingDatagramStream>,
     ) -> anyhow::Result<Resource<Pollable>> {
-        crate::preview2::poll::subscribe(self.table_mut(), this)
+        crate::preview2::poll::subscribe(self.table(), this)
     }
 
     fn drop(&mut self, this: Resource<udp::IncomingDatagramStream>) -> Result<(), anyhow::Error> {
-        let table = self.table_mut();
+        let table = self.table();
 
         // As in the filesystem implementation, we assume closing a socket
         // doesn't block.
@@ -427,7 +391,7 @@ impl Subscribe for IncomingDatagramStream {
 
 impl<T: WasiView> udp::HostOutgoingDatagramStream for T {
     fn check_send(&mut self, this: Resource<udp::OutgoingDatagramStream>) -> SocketResult<u64> {
-        let table = self.table_mut();
+        let table = self.table();
         let stream = table.get_mut(&this)?;
 
         let permit = match stream.send_state {
@@ -484,7 +448,7 @@ impl<T: WasiView> udp::HostOutgoingDatagramStream for T {
             Ok(())
         }
 
-        let table = self.table_mut();
+        let table = self.table();
         let stream = table.get_mut(&this)?;
 
         match stream.send_state {
@@ -533,11 +497,11 @@ impl<T: WasiView> udp::HostOutgoingDatagramStream for T {
         &mut self,
         this: Resource<udp::OutgoingDatagramStream>,
     ) -> anyhow::Result<Resource<Pollable>> {
-        crate::preview2::poll::subscribe(self.table_mut(), this)
+        crate::preview2::poll::subscribe(self.table(), this)
     }
 
     fn drop(&mut self, this: Resource<udp::OutgoingDatagramStream>) -> Result<(), anyhow::Error> {
-        let table = self.table_mut();
+        let table = self.table();
 
         // As in the filesystem implementation, we assume closing a socket
         // doesn't block.

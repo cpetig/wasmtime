@@ -2,12 +2,13 @@
 
 use crate::{
     isa::reg::Reg,
-    masm::{DivKind, IntCmpKind, OperandSize, RemKind, RoundingMode, ShiftKind},
+    masm::{DivKind, ExtendKind, IntCmpKind, OperandSize, RemKind, RoundingMode, ShiftKind},
 };
 use cranelift_codegen::{
     entity::EntityRef,
     ir::{types, ConstantPool, ExternalName, LibCall, Opcode, TrapCode, UserExternalNameRef},
     isa::{
+        unwind::UnwindInst,
         x64::{
             args::{
                 self, AluRmiROpcode, Amode, CmpOpcode, DivSignedness, ExtMode, FromWritableReg,
@@ -132,6 +133,20 @@ impl From<ShiftKind> for CraneliftShiftKind {
     }
 }
 
+impl From<ExtendKind> for ExtMode {
+    fn from(value: ExtendKind) -> Self {
+        match value {
+            ExtendKind::I64ExtendI32S | ExtendKind::I64ExtendI32U | ExtendKind::I64Extend32S => {
+                ExtMode::LQ
+            }
+            ExtendKind::I32Extend8S => ExtMode::BL,
+            ExtendKind::I32Extend16S => ExtMode::WL,
+            ExtendKind::I64Extend8S => ExtMode::BQ,
+            ExtendKind::I64Extend16S => ExtMode::WQ,
+        }
+    }
+}
+
 /// Low level assembler implementation for x64.
 pub(crate) struct Assembler {
     /// The machine instruction buffer.
@@ -213,6 +228,11 @@ impl Assembler {
                 SyntheticAmode::ConstantOffset(constant)
             }
         }
+    }
+
+    /// Emit an unwind instruction.
+    pub fn emit_unwind_inst(&mut self, inst: UnwindInst) {
+        self.emit(Inst::Unwind { inst })
     }
 
     /// Push register.
@@ -299,6 +319,24 @@ impl Assembler {
                 dst: dst.into(),
             });
         }
+    }
+
+    /// Register-to-register move with zero extension.
+    pub fn movzx_rr(&mut self, src: Reg, dst: Reg, kind: ExtendKind) {
+        self.emit(Inst::MovzxRmR {
+            ext_mode: kind.into(),
+            src: src.into(),
+            dst: dst.into(),
+        })
+    }
+
+    /// Register-to-register move with sign extension.
+    pub fn movsx_rr(&mut self, src: Reg, dst: Reg, kind: ExtendKind) {
+        self.emit(Inst::MovsxRmR {
+            ext_mode: kind.into(),
+            src: src.into(),
+            dst: dst.into(),
+        });
     }
 
     /// Integer register conditional move.
@@ -480,6 +518,127 @@ impl Assembler {
             dst: dst.into(),
             src_size: size.into(),
         })
+    }
+
+    pub fn xmm_to_gpr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        let op = match size {
+            OperandSize::S32 => SseOpcode::Movd,
+            OperandSize::S64 => SseOpcode::Movq,
+            OperandSize::S128 => unreachable!(),
+        };
+
+        self.emit(Inst::XmmToGpr {
+            op,
+            src: src.into(),
+            dst: dst.into(),
+            dst_size: size.into(),
+        });
+    }
+
+    /// Convert float to signed int.
+    pub fn cvt_float_to_sint_seq(
+        &mut self,
+        src: Reg,
+        dst: Reg,
+        tmp_gpr: Reg,
+        tmp_xmm: Reg,
+        src_size: OperandSize,
+        dst_size: OperandSize,
+    ) {
+        self.emit(Inst::CvtFloatToSintSeq {
+            dst_size: dst_size.into(),
+            src_size: src_size.into(),
+            is_saturating: false,
+            src: src.into(),
+            dst: dst.into(),
+            tmp_gpr: tmp_gpr.into(),
+            tmp_xmm: tmp_xmm.into(),
+        });
+    }
+
+    /// Convert float to unsigned int.
+    pub fn cvt_float_to_uint_seq(
+        &mut self,
+        src: Reg,
+        dst: Reg,
+        tmp_gpr: Reg,
+        tmp_xmm: Reg,
+        tmp_xmm2: Reg,
+        src_size: OperandSize,
+        dst_size: OperandSize,
+    ) {
+        self.emit(Inst::CvtFloatToUintSeq {
+            dst_size: dst_size.into(),
+            src_size: src_size.into(),
+            is_saturating: false,
+            src: src.into(),
+            dst: dst.into(),
+            tmp_gpr: tmp_gpr.into(),
+            tmp_xmm: tmp_xmm.into(),
+            tmp_xmm2: tmp_xmm2.into(),
+        });
+    }
+
+    /// Convert signed int to float.
+    pub fn cvt_sint_to_float(
+        &mut self,
+        src: Reg,
+        dst: Reg,
+        src_size: OperandSize,
+        dst_size: OperandSize,
+    ) {
+        let op = match dst_size {
+            OperandSize::S32 => SseOpcode::Cvtsi2ss,
+            OperandSize::S64 => SseOpcode::Cvtsi2sd,
+            OperandSize::S128 => unreachable!(),
+        };
+        self.emit(Inst::CvtIntToFloat {
+            op,
+            src1: dst.into(),
+            src2: src.into(),
+            dst: dst.into(),
+            src2_size: src_size.into(),
+        });
+    }
+
+    /// Convert unsigned 64-bit int to float.
+    pub fn cvt_uint64_to_float_seq(
+        &mut self,
+        src: Reg,
+        dst: Reg,
+        tmp_gpr1: Reg,
+        tmp_gpr2: Reg,
+        dst_size: OperandSize,
+    ) {
+        self.emit(Inst::CvtUint64ToFloatSeq {
+            dst_size: dst_size.into(),
+            src: src.into(),
+            dst: dst.into(),
+            tmp_gpr1: tmp_gpr1.into(),
+            tmp_gpr2: tmp_gpr2.into(),
+        });
+    }
+
+    /// Change precision of float.
+    pub fn cvt_float_to_float(
+        &mut self,
+        src: Reg,
+        dst: Reg,
+        src_size: OperandSize,
+        dst_size: OperandSize,
+    ) {
+        let op = match (src_size, dst_size) {
+            (OperandSize::S32, OperandSize::S64) => SseOpcode::Cvtss2sd,
+            (OperandSize::S64, OperandSize::S32) => SseOpcode::Cvtsd2ss,
+            _ => unimplemented!(),
+        };
+
+        self.emit(Inst::XmmRmRUnaligned {
+            op,
+            src2: Xmm::new(src.into()).expect("valid xmm unaligned").into(),
+            src1: dst.into(),
+            dst: dst.into(),
+        });
     }
 
     pub fn or_rr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
@@ -1006,9 +1165,10 @@ impl Assembler {
             OperandSize::S128 => unreachable!(),
         };
 
-        self.emit(Inst::XmmUnaryRmR {
+        self.emit(Inst::XmmRmR {
             op,
-            src: Xmm::from(src).into(),
+            src2: Xmm::from(src).into(),
+            src1: dst.into(),
             dst: dst.into(),
         })
     }
