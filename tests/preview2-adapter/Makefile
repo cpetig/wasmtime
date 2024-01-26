@@ -4,7 +4,7 @@ CFLAGS=--target=wasm32-wasi -g -O0
 all: component2.wasm
 
 test.wasm: main.c
-	$(CC) $(CFLAGS) -o $@ $^ -lc -L. -lwasi_snapshot_preview1 '-Wl,--export=wasi:cli/run@0.2.0-rc-2023-11-10#run' -Wl,--export=cabi_realloc
+	$(CC) $(CFLAGS) -o $@ $^ -lc -L. -lwasi_snapshot_preview1 '-Wl,--export=wasi:cli/run@0.2.0#run' -Wl,--export=cabi_realloc
 
 preview1.wasm: main.c
 	$(CC) $(CFLAGS) -o $@ $^

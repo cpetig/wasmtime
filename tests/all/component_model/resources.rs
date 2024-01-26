@@ -558,13 +558,16 @@ fn dynamic_val() -> Result<()> {
 
     let mut store = Store::new(&engine, ());
     let mut linker = Linker::new(&engine);
-    linker
+    let idx = linker
         .root()
         .resource("t1", ResourceType::host::<MyType>(), |_, _| Ok(()))?;
-    let i = linker.instantiate(&mut store, &c)?;
+    let i_pre = linker.instantiate_pre(&c)?;
+    let i = i_pre.instantiate(&mut store)?;
 
     let a = i.get_func(&mut store, "a").unwrap();
     let a_typed = i.get_typed_func::<(Resource<MyType>,), (ResourceAny,)>(&mut store, "a")?;
+    let a_typed_result =
+        i.get_typed_func::<(Resource<MyType>,), (Resource<MyType>,)>(&mut store, "a")?;
     let b = i.get_func(&mut store, "b").unwrap();
     let t2 = i.get_resource(&mut store, "t2").unwrap();
 
@@ -579,6 +582,66 @@ fn dynamic_val() -> Result<()> {
     match &results[0] {
         Val::Resource(resource) => {
             assert_eq!(resource.ty(), ResourceType::host::<MyType>());
+            assert!(resource.owned());
+
+            let resource = resource.try_into_resource::<MyType>(&mut store)?;
+            assert_eq!(resource.rep(), 100);
+            assert!(resource.owned());
+
+            let resource = resource.try_into_resource_any(&mut store, &i_pre, idx)?;
+            assert_eq!(resource.ty(), ResourceType::host::<MyType>());
+            assert!(resource.owned());
+        }
+        _ => unreachable!(),
+    }
+
+    let t1_any = Resource::<MyType>::new_own(100).try_into_resource_any(&mut store, &i_pre, idx)?;
+    let mut results = [Val::Bool(false)];
+    a.call(&mut store, &[Val::Resource(t1_any)], &mut results)?;
+    a.post_return(&mut store)?;
+    match &results[0] {
+        Val::Resource(resource) => {
+            assert_eq!(resource.ty(), ResourceType::host::<MyType>());
+            assert!(resource.owned());
+
+            let resource = resource.try_into_resource::<MyType>(&mut store)?;
+            assert_eq!(resource.rep(), 100);
+            assert!(resource.owned());
+
+            let resource = resource.try_into_resource_any(&mut store, &i_pre, idx)?;
+            assert_eq!(resource.ty(), ResourceType::host::<MyType>());
+            assert!(resource.owned());
+        }
+        _ => unreachable!(),
+    }
+
+    let t1 = Resource::<MyType>::new_own(100)
+        .try_into_resource_any(&mut store, &i_pre, idx)?
+        .try_into_resource(&mut store)?;
+    let (t1,) = a_typed_result.call(&mut store, (t1,))?;
+    a_typed_result.post_return(&mut store)?;
+    assert_eq!(t1.rep(), 100);
+    assert!(t1.owned());
+
+    let t1_any = t1
+        .try_into_resource_any(&mut store, &i_pre, idx)?
+        .try_into_resource::<MyType>(&mut store)?
+        .try_into_resource_any(&mut store, &i_pre, idx)?;
+    let mut results = [Val::Bool(false)];
+    a.call(&mut store, &[Val::Resource(t1_any)], &mut results)?;
+    a.post_return(&mut store)?;
+    match &results[0] {
+        Val::Resource(resource) => {
+            assert_eq!(resource.ty(), ResourceType::host::<MyType>());
+            assert!(resource.owned());
+
+            let resource = resource.try_into_resource::<MyType>(&mut store)?;
+            assert_eq!(resource.rep(), 100);
+            assert!(resource.owned());
+
+            let resource = resource.try_into_resource_any(&mut store, &i_pre, idx)?;
+            assert_eq!(resource.ty(), ResourceType::host::<MyType>());
+            assert!(resource.owned());
         }
         _ => unreachable!(),
     }
@@ -790,6 +853,72 @@ fn cannot_use_borrow_for_own() -> Result<()> {
     let resource = Resource::new_own(100);
     let err = f.call(&mut store, (&resource,)).unwrap_err();
     assert_eq!(err.to_string(), "cannot lift own resource from a borrow");
+    Ok(())
+}
+
+#[test]
+fn can_use_own_for_borrow() -> Result<()> {
+    let engine = super::engine();
+    let c = Component::new(
+        &engine,
+        r#"
+            (component
+                (import "t" (type $t (sub resource)))
+
+                (core func $drop (canon resource.drop $t))
+
+                (core module $m
+                    (import "" "drop" (func $drop (param i32)))
+                    (func (export "f") (param i32)
+                        (call $drop (local.get 0))
+                    )
+                )
+                (core instance $i (instantiate $m
+                    (with "" (instance
+                        (export "drop" (func $drop))
+                    ))
+                ))
+
+                (func (export "f") (param "x" (borrow $t))
+                    (canon lift (core func $i "f")))
+            )
+        "#,
+    )?;
+
+    struct MyType;
+
+    let mut store = Store::new(&engine, ());
+    let mut linker = Linker::new(&engine);
+    let ty_idx = linker
+        .root()
+        .resource("t", ResourceType::host::<MyType>(), |_, _| Ok(()))?;
+    let i_pre = linker.instantiate_pre(&c)?;
+    let i = i_pre.instantiate(&mut store)?;
+
+    let f = i.get_func(&mut store, "f").unwrap();
+    let f_typed = i.get_typed_func::<(&Resource<MyType>,), ()>(&mut store, "f")?;
+
+    let resource = Resource::new_own(100);
+    f_typed.call(&mut store, (&resource,))?;
+    f_typed.post_return(&mut store)?;
+
+    let resource = Resource::new_borrow(200);
+    f_typed.call(&mut store, (&resource,))?;
+    f_typed.post_return(&mut store)?;
+
+    let resource =
+        Resource::<MyType>::new_own(300).try_into_resource_any(&mut store, &i_pre, ty_idx)?;
+    f.call(&mut store, &[Val::Resource(resource)], &mut [])?;
+    f.post_return(&mut store)?;
+    resource.resource_drop(&mut store)?;
+
+    // TODO: Enable once https://github.com/bytecodealliance/wasmtime/issues/7793 is fixed
+    //let resource =
+    //    Resource::<MyType>::new_borrow(400).try_into_resource_any(&mut store, &i_pre, ty_idx)?;
+    //f.call(&mut store, &[Val::Resource(resource)], &mut [])?;
+    //f.post_return(&mut store)?;
+    //resource.resource_drop(&mut store)?;
+
     Ok(())
 }
 

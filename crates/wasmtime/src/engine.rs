@@ -1,5 +1,4 @@
-use crate::signatures::SignatureRegistry;
-use crate::Config;
+use crate::{profiling_agent::ProfilingAgent, signatures::SignatureRegistry, CodeMemory, Config};
 use anyhow::{Context, Result};
 use object::write::{Object, StandardSegment};
 use object::SectionKind;
@@ -13,7 +12,6 @@ use std::sync::Arc;
 use wasmtime_cache::CacheConfig;
 use wasmtime_environ::obj;
 use wasmtime_environ::{FlagValue, ObjectKind};
-use wasmtime_jit::{profiling::ProfilingAgent, CodeMemory};
 use wasmtime_runtime::{CompiledModuleIdAllocator, InstanceAllocator, MmapVec};
 
 mod serialization;
@@ -181,6 +179,11 @@ impl Engine {
     /// See [`Config::epoch_interruption`](crate::Config::epoch_interruption)
     /// for an introduction to epoch-based interruption and pointers
     /// to the other relevant methods.
+    ///
+    /// When performing `increment_epoch` in a separate thread, consider using
+    /// [`Engine::weak`] to hold an [`EngineWeak`] and performing
+    /// [`EngineWeak::upgrade`] on each tick, so that the epoch ticking thread
+    /// does not keep an [`Engine`] alive longer than any of its consumers.
     ///
     /// ## Signal Safety
     ///
@@ -656,6 +659,13 @@ impl Engine {
     pub fn detect_precompiled_file(&self, path: impl AsRef<Path>) -> Result<Option<Precompiled>> {
         serialization::detect_precompiled_file(path)
     }
+
+    /// Take a weak reference to this engine.
+    pub fn weak(&self) -> EngineWeak {
+        EngineWeak {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
 }
 
 impl Default for Engine {
@@ -671,6 +681,20 @@ pub enum Precompiled {
     Module,
     /// The input bytes look like a precompiled wasm component.
     Component,
+}
+
+/// A weak reference to an [`Engine`].
+#[derive(Clone)]
+pub struct EngineWeak {
+    inner: std::sync::Weak<EngineInner>,
+}
+
+impl EngineWeak {
+    /// Upgrade this weak reference into an [`Engine`]. Returns `None` if
+    /// strong references (the [`Engine`] type itself) no longer exist.
+    pub fn upgrade(&self) -> Option<Engine> {
+        std::sync::Weak::upgrade(&self.inner).map(|inner| Engine { inner })
+    }
 }
 
 #[cfg(test)]
@@ -788,5 +812,18 @@ mod tests {
         assert_ne!(default_version_hash, none_version_hash);
 
         Ok(())
+    }
+
+    #[test]
+    fn engine_weak_upgrades() {
+        let engine = Engine::default();
+        let weak = engine.weak();
+        weak.upgrade()
+            .expect("engine is still alive, so weak reference can upgrade");
+        drop(engine);
+        assert!(
+            weak.upgrade().is_none(),
+            "engine was dropped, so weak reference cannot upgrade"
+        );
     }
 }

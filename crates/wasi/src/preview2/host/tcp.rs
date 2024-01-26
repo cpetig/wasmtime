@@ -11,7 +11,6 @@ use crate::preview2::{
 };
 use crate::preview2::{Pollable, SocketResult, WasiView};
 use cap_net_ext::Blocking;
-use cap_std::net::TcpListener;
 use io_lifetimes::AsSocketlike;
 use rustix::io::Errno;
 use rustix::net::sockopt;
@@ -30,7 +29,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         local_address: IpSocketAddress,
     ) -> SocketResult<()> {
         self.ctx().allowed_network_uses.check_allowed_tcp()?;
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get(&this)?;
         let network = table.get(&network)?;
         let local_address: SocketAddr = local_address.into();
@@ -47,21 +46,27 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         {
             // Ensure that we're allowed to connect to this address.
             network.check_socket_addr(&local_address, SocketAddrUse::TcpBind)?;
-            let listener = &*socket.tcp_socket().as_socketlike_view::<TcpListener>();
+
+            // Automatically bypass the TIME_WAIT state when the user is trying
+            // to bind to a specific port:
+            let reuse_addr = local_address.port() > 0;
+
+            // Unconditionally (re)set SO_REUSEADDR, even when the value is false.
+            // This ensures we're not accidentally affected by any socket option
+            // state left behind by a previous failed call to this method (start_bind).
+            util::set_tcp_reuseaddr(socket.tcp_socket(), reuse_addr)?;
 
             // Perform the OS bind call.
-            util::tcp_bind(listener, &local_address).map_err(|error| {
-                match Errno::from_io_error(&error) {
-                    // From https://pubs.opengroup.org/onlinepubs/9699919799/functions/bind.html:
-                    // > [EAFNOSUPPORT] The specified address is not a valid address for the address family of the specified socket
-                    //
-                    // The most common reasons for this error should have already
-                    // been handled by our own validation slightly higher up in this
-                    // function. This error mapping is here just in case there is
-                    // an edge case we didn't catch.
-                    Some(Errno::AFNOSUPPORT) => ErrorCode::InvalidArgument,
-                    _ => ErrorCode::from(error),
-                }
+            util::tcp_bind(socket.tcp_socket(), &local_address).map_err(|error| match error {
+                // From https://pubs.opengroup.org/onlinepubs/9699919799/functions/bind.html:
+                // > [EAFNOSUPPORT] The specified address is not a valid address for the address family of the specified socket
+                //
+                // The most common reasons for this error should have already
+                // been handled by our own validation slightly higher up in this
+                // function. This error mapping is here just in case there is
+                // an edge case we didn't catch.
+                Errno::AFNOSUPPORT => ErrorCode::InvalidArgument,
+                _ => ErrorCode::from(error),
             })?;
         }
 
@@ -72,7 +77,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
     }
 
     fn finish_bind(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<()> {
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
 
         match socket.tcp_state {
@@ -92,7 +97,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         remote_address: IpSocketAddress,
     ) -> SocketResult<()> {
         self.ctx().allowed_network_uses.check_allowed_tcp()?;
-        let table = self.table_mut();
+        let table = self.table();
         let r = {
             let socket = table.get(&this)?;
             let network = table.get(&network)?;
@@ -116,10 +121,9 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
 
             // Ensure that we're allowed to connect to this address.
             network.check_socket_addr(&remote_address, SocketAddrUse::TcpConnect)?;
-            let listener = &*socket.tcp_socket().as_socketlike_view::<TcpListener>();
 
             // Do an OS `connect`. Our socket is non-blocking, so it'll either...
-            util::tcp_connect(listener, &remote_address)
+            util::tcp_connect(socket.tcp_socket(), &remote_address)
         };
 
         match r {
@@ -130,11 +134,11 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
                 return Ok(());
             }
             // continue in progress,
-            Err(err) if Errno::from_io_error(&err) == Some(Errno::INPROGRESS) => {}
+            Err(err) if err == Errno::INPROGRESS => {}
             // or fail immediately.
             Err(err) => {
-                return Err(match Errno::from_io_error(&err) {
-                    Some(Errno::AFNOSUPPORT) => ErrorCode::InvalidArgument.into(), // See `bind` implementation.
+                return Err(match err {
+                    Errno::AFNOSUPPORT => ErrorCode::InvalidArgument.into(), // See `bind` implementation.
                     _ => err.into(),
                 });
             }
@@ -150,7 +154,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         &mut self,
         this: Resource<tcp::TcpSocket>,
     ) -> SocketResult<(Resource<InputStream>, Resource<OutputStream>)> {
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
 
         match socket.tcp_state {
@@ -184,15 +188,15 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
 
         socket.tcp_state = TcpState::Connected;
         let (input, output) = socket.as_split();
-        let input_stream = self.table_mut().push_child(input, &this)?;
-        let output_stream = self.table_mut().push_child(output, &this)?;
+        let input_stream = self.table().push_child(input, &this)?;
+        let output_stream = self.table().push_child(output, &this)?;
 
         Ok((input_stream, output_stream))
     }
 
     fn start_listen(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<()> {
         self.ctx().allowed_network_uses.check_allowed_tcp()?;
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
 
         match socket.tcp_state {
@@ -207,10 +211,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
             | TcpState::BindStarted => return Err(ErrorCode::ConcurrencyConflict.into()),
         }
 
-        {
-            let listener = &*socket.tcp_socket().as_socketlike_view::<TcpListener>();
-            util::tcp_listen(listener, socket.listen_backlog_size)?;
-        }
+        util::tcp_listen(socket.tcp_socket(), socket.listen_backlog_size)?;
 
         socket.tcp_state = TcpState::ListenStarted;
 
@@ -218,7 +219,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
     }
 
     fn finish_listen(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<()> {
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
 
         match socket.tcp_state {
@@ -250,9 +251,8 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
 
         // Do the OS accept call.
         let tcp_socket = socket.tcp_socket();
-        let (connection, _addr) = tcp_socket.try_io(Interest::READABLE, || {
-            let listener = &*tcp_socket.as_socketlike_view::<TcpListener>();
-            util::tcp_accept(listener, Blocking::No)
+        let (client_fd, _addr) = tcp_socket.try_io(Interest::READABLE, || {
+            util::tcp_accept(tcp_socket, Blocking::No)
         })?;
 
         #[cfg(target_os = "macos")]
@@ -262,25 +262,24 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
             // and only if a specific value was explicitly set on the listener.
 
             if let Some(size) = socket.receive_buffer_size {
-                _ = util::set_socket_recv_buffer_size(&connection, size); // Ignore potential error.
+                _ = util::set_socket_recv_buffer_size(&client_fd, size); // Ignore potential error.
             }
 
             if let Some(size) = socket.send_buffer_size {
-                _ = util::set_socket_send_buffer_size(&connection, size); // Ignore potential error.
+                _ = util::set_socket_send_buffer_size(&client_fd, size); // Ignore potential error.
             }
 
             // For some reason, IP_TTL is inherited, but IPV6_UNICAST_HOPS isn't.
-            if let (SocketAddressFamily::Ipv6 { .. }, Some(ttl)) = (socket.family, socket.hop_limit)
-            {
-                _ = util::set_ipv6_unicast_hops(&connection, ttl); // Ignore potential error.
+            if let (SocketAddressFamily::Ipv6, Some(ttl)) = (socket.family, socket.hop_limit) {
+                _ = util::set_ipv6_unicast_hops(&client_fd, ttl); // Ignore potential error.
             }
 
             if let Some(value) = socket.keep_alive_idle_time {
-                _ = util::set_tcp_keepidle(&connection, value); // Ignore potential error.
+                _ = util::set_tcp_keepidle(&client_fd, value); // Ignore potential error.
             }
         }
 
-        let mut tcp_socket = TcpSocket::from_tcp_stream(connection, socket.family)?;
+        let mut tcp_socket = TcpSocket::from_fd(client_fd, socket.family)?;
 
         // Mark the socket as connected so that we can exit early from methods like `start-bind`.
         tcp_socket.tcp_state = TcpState::Connected;
@@ -288,9 +287,9 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         let (input, output) = tcp_socket.as_split();
         let output: OutputStream = output;
 
-        let tcp_socket = self.table_mut().push(tcp_socket)?;
-        let input_stream = self.table_mut().push_child(input, &tcp_socket)?;
-        let output_stream = self.table_mut().push_child(output, &tcp_socket)?;
+        let tcp_socket = self.table().push(tcp_socket)?;
+        let input_stream = self.table().push_child(input, &tcp_socket)?;
+        let output_stream = self.table().push_child(output, &tcp_socket)?;
 
         Ok((tcp_socket, input_stream, output_stream))
     }
@@ -350,38 +349,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
 
         match socket.family {
             SocketAddressFamily::Ipv4 => Ok(IpAddressFamily::Ipv4),
-            SocketAddressFamily::Ipv6 { .. } => Ok(IpAddressFamily::Ipv6),
-        }
-    }
-
-    fn ipv6_only(&mut self, this: Resource<tcp::TcpSocket>) -> SocketResult<bool> {
-        let table = self.table();
-        let socket = table.get(&this)?;
-
-        // Instead of just calling the OS we return our own internal state, because
-        // MacOS doesn't propagate the V6ONLY state on to accepted client sockets.
-
-        match socket.family {
-            SocketAddressFamily::Ipv4 => Err(ErrorCode::NotSupported.into()),
-            SocketAddressFamily::Ipv6 { v6only } => Ok(v6only),
-        }
-    }
-
-    fn set_ipv6_only(&mut self, this: Resource<tcp::TcpSocket>, value: bool) -> SocketResult<()> {
-        let table = self.table_mut();
-        let socket = table.get_mut(&this)?;
-
-        match socket.family {
-            SocketAddressFamily::Ipv4 => Err(ErrorCode::NotSupported.into()),
-            SocketAddressFamily::Ipv6 { .. } => match socket.tcp_state {
-                TcpState::Default => {
-                    sockopt::set_ipv6_v6only(socket.tcp_socket(), value)?;
-                    socket.family = SocketAddressFamily::Ipv6 { v6only: value };
-                    Ok(())
-                }
-                TcpState::BindStarted => Err(ErrorCode::ConcurrencyConflict.into()),
-                _ => Err(ErrorCode::InvalidState.into()),
-            },
+            SocketAddressFamily::Ipv6 => Ok(IpAddressFamily::Ipv6),
         }
     }
 
@@ -393,7 +361,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         const MIN_BACKLOG: i32 = 1;
         const MAX_BACKLOG: i32 = i32::MAX; // OS'es will most likely limit it down even further.
 
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
 
         if value == 0 {
@@ -458,7 +426,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         this: Resource<tcp::TcpSocket>,
         value: u64,
     ) -> SocketResult<()> {
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
 
         let duration = Duration::from_nanos(value);
@@ -514,21 +482,19 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
 
         let ttl = match socket.family {
             SocketAddressFamily::Ipv4 => util::get_ip_ttl(socket.tcp_socket())?,
-            SocketAddressFamily::Ipv6 { .. } => util::get_ipv6_unicast_hops(socket.tcp_socket())?,
+            SocketAddressFamily::Ipv6 => util::get_ipv6_unicast_hops(socket.tcp_socket())?,
         };
 
         Ok(ttl)
     }
 
     fn set_hop_limit(&mut self, this: Resource<tcp::TcpSocket>, value: u8) -> SocketResult<()> {
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
 
         match socket.family {
             SocketAddressFamily::Ipv4 => util::set_ip_ttl(socket.tcp_socket(), value)?,
-            SocketAddressFamily::Ipv6 { .. } => {
-                util::set_ipv6_unicast_hops(socket.tcp_socket(), value)?
-            }
+            SocketAddressFamily::Ipv6 => util::set_ipv6_unicast_hops(socket.tcp_socket(), value)?,
         }
 
         #[cfg(target_os = "macos")]
@@ -552,7 +518,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         this: Resource<tcp::TcpSocket>,
         value: u64,
     ) -> SocketResult<()> {
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
         let value = value.try_into().unwrap_or(usize::MAX);
 
@@ -579,7 +545,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
         this: Resource<tcp::TcpSocket>,
         value: u64,
     ) -> SocketResult<()> {
-        let table = self.table_mut();
+        let table = self.table();
         let socket = table.get_mut(&this)?;
         let value = value.try_into().unwrap_or(usize::MAX);
 
@@ -594,7 +560,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
     }
 
     fn subscribe(&mut self, this: Resource<tcp::TcpSocket>) -> anyhow::Result<Resource<Pollable>> {
-        crate::preview2::poll::subscribe(self.table_mut(), this)
+        crate::preview2::poll::subscribe(self.table(), this)
     }
 
     fn shutdown(
@@ -627,7 +593,7 @@ impl<T: WasiView> crate::preview2::host::tcp::tcp::HostTcpSocket for T {
     }
 
     fn drop(&mut self, this: Resource<tcp::TcpSocket>) -> Result<(), anyhow::Error> {
-        let table = self.table_mut();
+        let table = self.table();
 
         // As in the filesystem implementation, we assume closing a socket
         // doesn't block.

@@ -16,7 +16,7 @@ impl<T: WasiView> network::Host for T {
 
 impl<T: WasiView> crate::preview2::bindings::sockets::network::HostNetwork for T {
     fn drop(&mut self, this: Resource<network::Network>) -> Result<(), anyhow::Error> {
-        let table = self.table_mut();
+        let table = self.table();
 
         table.delete(this)?;
 
@@ -218,9 +218,9 @@ pub(crate) mod util {
     use crate::preview2::bindings::sockets::network::ErrorCode;
     use crate::preview2::network::SocketAddressFamily;
     use crate::preview2::SocketResult;
-    use cap_net_ext::{Blocking, TcpListenerExt};
-    use cap_std::net::{TcpListener, TcpStream, UdpSocket};
-    use rustix::fd::AsFd;
+    use cap_net_ext::{AddressFamily, Blocking, TcpListenerExt, UdpSocketExt};
+    use io_lifetimes::AsSocketlike;
+    use rustix::fd::{AsFd, OwnedFd};
     use rustix::io::Errno;
     use rustix::net::sockopt;
 
@@ -261,14 +261,14 @@ pub(crate) mod util {
     ) -> SocketResult<()> {
         match (socket_family, addr.ip()) {
             (SocketAddressFamily::Ipv4, IpAddr::V4(_)) => Ok(()),
-            (SocketAddressFamily::Ipv6 { v6only }, IpAddr::V6(ipv6)) => {
+            (SocketAddressFamily::Ipv6, IpAddr::V6(ipv6)) => {
                 if is_deprecated_ipv4_compatible(&ipv6) {
                     // Reject IPv4-*compatible* IPv6 addresses. They have been deprecated
                     // since 2006, OS handling of them is inconsistent and our own
                     // validations don't take them into account either.
                     // Note that these are not the same as IPv4-*mapped* IPv6 addresses.
                     Err(ErrorCode::InvalidArgument.into())
-                } else if *v6only && ipv6.to_ipv4_mapped().is_some() {
+                } else if ipv6.to_ipv4_mapped().is_some() {
                     Err(ErrorCode::InvalidArgument.into())
                 } else {
                     Ok(())
@@ -302,42 +302,64 @@ pub(crate) mod util {
      * Syscalls wrappers with (opinionated) portability fixes.
      */
 
-    pub fn tcp_bind(listener: &TcpListener, addr: &SocketAddr) -> std::io::Result<()> {
-        rustix::net::bind(listener, addr).map_err(|error| match error {
+    pub fn tcp_socket(family: AddressFamily, blocking: Blocking) -> std::io::Result<OwnedFd> {
+        // Delegate socket creation to cap_net_ext. They handle a couple of things for us:
+        // - On Windows: call WSAStartup if not done before.
+        // - Set the NONBLOCK and CLOEXEC flags. Either immediately during socket creation,
+        //   or afterwards using ioctl or fcntl. Exact method depends on the platform.
+
+        let listener = cap_std::net::TcpListener::new(family, blocking)?;
+        Ok(OwnedFd::from(listener))
+    }
+
+    pub fn udp_socket(family: AddressFamily, blocking: Blocking) -> std::io::Result<OwnedFd> {
+        // Delegate socket creation to cap_net_ext. They handle a couple of things for us:
+        // - On Windows: call WSAStartup if not done before.
+        // - Set the NONBLOCK and CLOEXEC flags. Either immediately during socket creation,
+        //   or afterwards using ioctl or fcntl. Exact method depends on the platform.
+
+        let socket = cap_std::net::UdpSocket::new(family, blocking)?;
+        Ok(OwnedFd::from(socket))
+    }
+
+    pub fn tcp_bind<Fd: AsFd>(sockfd: Fd, addr: &SocketAddr) -> rustix::io::Result<()> {
+        rustix::net::bind(sockfd, addr).map_err(|error| match error {
             // See: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-bind#:~:text=WSAENOBUFS
             // Windows returns WSAENOBUFS when the ephemeral ports have been exhausted.
             #[cfg(windows)]
-            Errno::NOBUFS => Errno::ADDRINUSE.into(),
-            _ => error.into(),
+            Errno::NOBUFS => Errno::ADDRINUSE,
+            _ => error,
         })
     }
 
-    pub fn udp_bind(socket: &UdpSocket, addr: &SocketAddr) -> std::io::Result<()> {
-        rustix::net::bind(socket, addr).map_err(|error| {
-            match error {
-                // See: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-bind#:~:text=WSAENOBUFS
-                // Windows returns WSAENOBUFS when the ephemeral ports have been exhausted.
-                #[cfg(windows)]
-                Errno::NOBUFS => Errno::ADDRINUSE.into(),
-                _ => error.into(),
-            }
+    pub fn udp_bind<Fd: AsFd>(sockfd: Fd, addr: &SocketAddr) -> rustix::io::Result<()> {
+        rustix::net::bind(sockfd, addr).map_err(|error| match error {
+            // See: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-bind#:~:text=WSAENOBUFS
+            // Windows returns WSAENOBUFS when the ephemeral ports have been exhausted.
+            #[cfg(windows)]
+            Errno::NOBUFS => Errno::ADDRINUSE,
+            _ => error,
         })
     }
 
-    pub fn tcp_connect(listener: &TcpListener, addr: &SocketAddr) -> std::io::Result<()> {
-        rustix::net::connect(listener, addr).map_err(|error| match error {
+    pub fn tcp_connect<Fd: AsFd>(sockfd: Fd, addr: &SocketAddr) -> rustix::io::Result<()> {
+        rustix::net::connect(sockfd, addr).map_err(|error| match error {
             // On POSIX, non-blocking `connect` returns `EINPROGRESS`.
             // Windows returns `WSAEWOULDBLOCK`.
             //
             // This normalized error code is depended upon by: tcp.rs
             #[cfg(windows)]
-            Errno::WOULDBLOCK => Errno::INPROGRESS.into(),
-            _ => error.into(),
+            Errno::WOULDBLOCK => Errno::INPROGRESS,
+            _ => error,
         })
     }
 
-    pub fn tcp_listen(listener: &TcpListener, backlog: Option<i32>) -> std::io::Result<()> {
-        listener
+    pub fn tcp_listen<Fd: AsFd>(sockfd: Fd, backlog: Option<i32>) -> std::io::Result<()> {
+        // Delegate `listen` to cap_net_ext. That is a thin wrapper around rustix::net::listen,
+        // with a platform-dependent default value for the backlog size.
+        sockfd
+            .as_fd()
+            .as_socketlike_view::<cap_std::net::TcpListener>()
             .listen(backlog)
             .map_err(|error| match Errno::from_io_error(&error) {
                 // See: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-listen#:~:text=WSAEMFILE
@@ -351,15 +373,22 @@ pub(crate) mod util {
                 // on Microsoft's documentation here.
                 #[cfg(windows)]
                 Some(Errno::MFILE) => Errno::NOBUFS.into(),
+
                 _ => error,
             })
     }
 
-    pub fn tcp_accept(
-        listener: &TcpListener,
+    pub fn tcp_accept<Fd: AsFd>(
+        sockfd: Fd,
         blocking: Blocking,
-    ) -> std::io::Result<(TcpStream, SocketAddr)> {
-        listener
+    ) -> std::io::Result<(OwnedFd, SocketAddr)> {
+        // Delegate `accept` to cap_net_ext. They set the NONBLOCK and CLOEXEC flags
+        // for us. Either immediately as a flag to `accept`, or afterwards using
+        // ioctl or fcntl. Exact method depends on the platform.
+
+        let (client, addr) = sockfd
+            .as_fd()
+            .as_socketlike_view::<cap_std::net::TcpListener>()
             .accept_with(blocking)
             .map_err(|error| match Errno::from_io_error(&error) {
                 // From: https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-accept#:~:text=WSAEINPROGRESS
@@ -393,7 +422,9 @@ pub(crate) mod util {
                 ) => Errno::CONNABORTED.into(),
 
                 _ => error,
-            })
+            })?;
+
+        Ok((client.into(), addr))
     }
 
     pub fn udp_disconnect<Fd: AsFd>(sockfd: Fd) -> rustix::io::Result<()> {
@@ -413,6 +444,34 @@ pub(crate) mod util {
             Err(Errno::INVAL | Errno::AFNOSUPPORT) => Ok(()),
             r => r,
         }
+    }
+
+    // Even though SO_REUSEADDR is a SOL_* level option, this function contain a
+    // compatibility fix specific to TCP. That's why it contains the `_tcp_` infix instead of `_socket_`.
+    #[allow(unused_variables)] // Parameters are not used on Windows
+    pub fn set_tcp_reuseaddr<Fd: AsFd>(sockfd: Fd, value: bool) -> rustix::io::Result<()> {
+        // When a TCP socket is closed, the system may
+        // temporarily reserve that specific address+port pair in a so called
+        // TIME_WAIT state. During that period, any attempt to rebind to that pair
+        // will fail. Setting SO_REUSEADDR to true bypasses that behaviour. Unlike
+        // the name "SO_REUSEADDR" might suggest, it does not allow multiple
+        // active sockets to share the same local address.
+
+        // On Windows that behavior is the default, so there is no need to manually
+        // configure such an option. But (!), Windows _does_ have an identically
+        // named socket option which allows users to "hijack" active sockets.
+        // This is definitely not what we want to do here.
+
+        // Microsoft's own documentation[1] states that we should set SO_EXCLUSIVEADDRUSE
+        // instead (to the inverse value), however the github issue below[2] seems
+        // to indicate that that may no longer be correct.
+        // [1]: https://docs.microsoft.com/en-us/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse
+        // [2]: https://github.com/python-trio/trio/issues/928
+
+        #[cfg(not(windows))]
+        sockopt::set_socket_reuseaddr(sockfd, value)?;
+
+        Ok(())
     }
 
     pub fn set_tcp_keepidle<Fd: AsFd>(sockfd: Fd, value: Duration) -> rustix::io::Result<()> {
