@@ -3,8 +3,7 @@
 use crate::alias_analysis::{AliasAnalysis, LastStores};
 use crate::ctxhash::{CtxEq, CtxHash, CtxHashMap};
 use crate::cursor::{Cursor, CursorPosition, FuncCursor};
-use crate::dominator_tree::DominatorTree;
-use crate::egraph::domtree::DomTreeWithChildren;
+use crate::dominator_tree::{DominatorTree, DominatorTreePreorder};
 use crate::egraph::elaborate::Elaborator;
 use crate::fx::FxHashSet;
 use crate::inst_predicates::{is_mergeable_for_egraph, is_pure_for_egraph};
@@ -22,7 +21,6 @@ use smallvec::SmallVec;
 use std::hash::Hasher;
 
 mod cost;
-mod domtree;
 mod elaborate;
 
 /// Pass over a Function that does the whole aegraph thing.
@@ -46,14 +44,12 @@ mod elaborate;
 pub struct EgraphPass<'a> {
     /// The function we're operating on.
     func: &'a mut Function,
-    /// Dominator tree, used for elaboration pass.
-    domtree: &'a DominatorTree,
+    /// Dominator tree for the CFG, used to visit blocks in pre-order
+    /// so we see value definitions before their uses, and also used for
+    /// O(1) dominance checks.
+    domtree: DominatorTreePreorder,
     /// Alias analysis, used during optimization.
     alias_analysis: &'a mut AliasAnalysis<'a>,
-    /// "Domtree with children": like `domtree`, but with an explicit
-    /// list of children, complementing the parent pointers stored
-    /// in `domtree`.
-    domtree_children: DomTreeWithChildren,
     /// Loop analysis results, used for built-in LICM during
     /// elaboration.
     loop_analysis: &'a LoopAnalysis,
@@ -67,7 +63,7 @@ pub struct EgraphPass<'a> {
     pub(crate) stats: Stats,
     /// Union-find that maps all members of a Union tree (eclass) back
     /// to the *oldest* (lowest-numbered) `Value`.
-    eclasses: UnionFind<Value>,
+    pub(crate) eclasses: UnionFind<Value>,
 }
 
 // The maximum number of rewrites we will take from a single call into ISLE.
@@ -109,7 +105,7 @@ impl NewOrExistingInst {
             NewOrExistingInst::New(data, ty) => (*ty, *data),
             NewOrExistingInst::Existing(inst) => {
                 let ty = dfg.ctrl_typevar(*inst);
-                (ty, dfg.insts[*inst].clone())
+                (ty, dfg.insts[*inst])
             }
         }
     }
@@ -195,15 +191,17 @@ where
             };
 
             let opt_value = self.optimize_pure_enode(inst);
+
+            for &argument in self.func.dfg.inst_args(inst) {
+                self.eclasses.pin_index(argument);
+            }
+
             let gvn_context = GVNContext {
                 union_find: self.eclasses,
                 value_lists: &self.func.dfg.value_lists,
             };
-            self.gvn_map.insert(
-                (ty, self.func.dfg.insts[inst].clone()),
-                opt_value,
-                &gvn_context,
-            );
+            self.gvn_map
+                .insert((ty, self.func.dfg.insts[inst]), opt_value, &gvn_context);
             self.value_to_opt_value[result] = opt_value;
             opt_value
         }
@@ -399,16 +397,16 @@ impl<'a> EgraphPass<'a> {
     /// Create a new EgraphPass.
     pub fn new(
         func: &'a mut Function,
-        domtree: &'a DominatorTree,
+        raw_domtree: &'a DominatorTree,
         loop_analysis: &'a LoopAnalysis,
         alias_analysis: &'a mut AliasAnalysis<'a>,
     ) -> Self {
         let num_values = func.dfg.num_values();
-        let domtree_children = DomTreeWithChildren::new(func, domtree);
+        let mut domtree = DominatorTreePreorder::new();
+        domtree.compute(raw_domtree, &func.layout);
         Self {
             func,
             domtree,
-            domtree_children,
             loop_analysis,
             alias_analysis,
             stats: Stats::default(),
@@ -434,6 +432,7 @@ impl<'a> EgraphPass<'a> {
             }
         }
         trace!("stats: {:#?}", self.stats);
+        trace!("pinned_union_count: {}", self.eclasses.pinned_union_count);
         self.elaborate();
     }
 
@@ -494,7 +493,7 @@ impl<'a> EgraphPass<'a> {
 
         // In domtree preorder, visit blocks. (TODO: factor out an
         // iterator from this and elaborator.)
-        let root = self.domtree_children.root();
+        let root = cursor.layout().entry_block().unwrap();
         enum StackEntry {
             Visit(Block),
             Pop,
@@ -506,8 +505,7 @@ impl<'a> EgraphPass<'a> {
                     // We popped this block; push children
                     // immediately, then process this block.
                     block_stack.push(StackEntry::Pop);
-                    block_stack
-                        .extend(self.domtree_children.children(block).map(StackEntry::Visit));
+                    block_stack.extend(self.domtree.children(block).map(StackEntry::Visit));
                     effectful_gvn_map.increment_depth();
 
                     trace!("Processing block {}", block);
@@ -612,11 +610,9 @@ impl<'a> EgraphPass<'a> {
     fn elaborate(&mut self) {
         let mut elaborator = Elaborator::new(
             self.func,
-            self.domtree,
-            &self.domtree_children,
+            &self.domtree,
             self.loop_analysis,
             &mut self.remat_values,
-            &mut self.eclasses,
             &mut self.stats,
         );
         elaborator.elaborate();
@@ -701,4 +697,5 @@ pub(crate) struct Stats {
     pub(crate) elaborate_func: u64,
     pub(crate) elaborate_func_pre_insts: u64,
     pub(crate) elaborate_func_post_insts: u64,
+    pub(crate) elaborate_best_cost_fixpoint_iters: u64,
 }

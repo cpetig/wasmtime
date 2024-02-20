@@ -21,6 +21,7 @@ mod stacks;
 use self::diff_wasmtime::WasmtimeInstance;
 use self::engine::{DiffEngine, DiffInstance};
 use crate::generators::{self, DiffValue, DiffValueType};
+use crate::single_module_fuzzer::KnownValid;
 use arbitrary::Arbitrary;
 pub use stacks::check_stacks;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -135,7 +136,12 @@ pub enum Timeout {
 /// panic or segfault or anything else that can be detected "passively".
 ///
 /// The engine will be configured using provided config.
-pub fn instantiate(wasm: &[u8], known_valid: bool, config: &generators::Config, timeout: Timeout) {
+pub fn instantiate(
+    wasm: &[u8],
+    known_valid: KnownValid,
+    config: &generators::Config,
+    timeout: Timeout,
+) {
     let mut store = config.to_store();
 
     let module = match compile_module(store.engine(), wasm, known_valid, config) {
@@ -193,7 +199,7 @@ pub enum Command {
 /// The modules are expected to *not* have start functions as no timeouts are configured.
 pub fn instantiate_many(
     modules: &[Vec<u8>],
-    known_valid: bool,
+    known_valid: KnownValid,
     config: &generators::Config,
     commands: &[Command],
 ) {
@@ -246,13 +252,13 @@ pub fn instantiate_many(
 fn compile_module(
     engine: &Engine,
     bytes: &[u8],
-    known_valid: bool,
+    known_valid: KnownValid,
     config: &generators::Config,
 ) -> Option<Module> {
     log_wasm(bytes);
     match config.compile(engine, bytes) {
         Ok(module) => Some(module),
-        Err(_) if !known_valid => None,
+        Err(_) if known_valid == KnownValid::No => None,
         Err(e) => {
             if let generators::InstanceAllocationStrategy::Pooling(c) = &config.wasmtime.strategy {
                 // When using the pooling allocator, accept failures to compile
@@ -559,9 +565,10 @@ pub fn make_api_calls(api: generators::api::ApiCalls) {
                 let nth = nth % funcs.len();
                 let f = &funcs[nth];
                 let ty = f.ty(&store);
-                let params = dummy::dummy_values(ty.params());
-                let mut results = vec![Val::I32(0); ty.results().len()];
-                let _ = f.call(store, &params, &mut results);
+                if let Ok(params) = dummy::dummy_values(ty.params()) {
+                    let mut results = vec![Val::I32(0); ty.results().len()];
+                    let _ = f.call(store, &params, &mut results);
+                }
             }
         }
     }
@@ -602,7 +609,7 @@ pub fn table_ops(
 
         let wasm = ops.to_wasm_binary();
         log_wasm(&wasm);
-        let module = match compile_module(store.engine(), &wasm, false, &fuzz_config) {
+        let module = match compile_module(store.engine(), &wasm, KnownValid::No, &fuzz_config) {
             Some(m) => m,
             None => return 0,
         };
@@ -616,36 +623,34 @@ pub fn table_ops(
         // NB: use `Func::new` so that this can still compile on the old x86
         // backend, where `IntoFunc` isn't implemented for multi-value
         // returns.
-        let func = Func::new(
-            &mut store,
-            FuncType::new(
-                vec![],
-                vec![ValType::ExternRef, ValType::ExternRef, ValType::ExternRef],
-            ),
-            {
-                let num_dropped = num_dropped.clone();
-                let expected_drops = expected_drops.clone();
-                let num_gcs = num_gcs.clone();
-                move |mut caller: Caller<'_, StoreLimits>, _params, results| {
-                    log::info!("table_ops: GC");
-                    if num_gcs.fetch_add(1, SeqCst) < MAX_GCS {
-                        caller.gc();
-                    }
-
-                    let a = ExternRef::new(CountDrops(num_dropped.clone()));
-                    let b = ExternRef::new(CountDrops(num_dropped.clone()));
-                    let c = ExternRef::new(CountDrops(num_dropped.clone()));
-
-                    log::info!("table_ops: make_refs() -> ({:p}, {:p}, {:p})", a, b, c);
-
-                    expected_drops.fetch_add(3, SeqCst);
-                    results[0] = Some(a).into();
-                    results[1] = Some(b).into();
-                    results[2] = Some(c).into();
-                    Ok(())
-                }
-            },
+        let func_ty = FuncType::new(
+            store.engine(),
+            vec![],
+            vec![ValType::EXTERNREF, ValType::EXTERNREF, ValType::EXTERNREF],
         );
+        let func = Func::new(&mut store, func_ty, {
+            let num_dropped = num_dropped.clone();
+            let expected_drops = expected_drops.clone();
+            let num_gcs = num_gcs.clone();
+            move |mut caller: Caller<'_, StoreLimits>, _params, results| {
+                log::info!("table_ops: GC");
+                if num_gcs.fetch_add(1, SeqCst) < MAX_GCS {
+                    caller.gc();
+                }
+
+                let a = ExternRef::new(CountDrops(num_dropped.clone()));
+                let b = ExternRef::new(CountDrops(num_dropped.clone()));
+                let c = ExternRef::new(CountDrops(num_dropped.clone()));
+
+                log::info!("table_ops: make_refs() -> ({:p}, {:p}, {:p})", a, b, c);
+
+                expected_drops.fetch_add(3, SeqCst);
+                results[0] = Some(a).into();
+                results[1] = Some(b).into();
+                results[2] = Some(c).into();
+                Ok(())
+            }
+        });
         linker.define(&store, "", "gc", func).unwrap();
 
         linker
@@ -691,25 +696,23 @@ pub fn table_ops(
         // NB: use `Func::new` so that this can still compile on the old
         // x86 backend, where `IntoFunc` isn't implemented for
         // multi-value returns.
-        let func = Func::new(
-            &mut store,
-            FuncType::new(
-                vec![],
-                vec![ValType::ExternRef, ValType::ExternRef, ValType::ExternRef],
-            ),
-            {
-                let num_dropped = num_dropped.clone();
-                let expected_drops = expected_drops.clone();
-                move |_caller, _params, results| {
-                    log::info!("table_ops: make_refs");
-                    expected_drops.fetch_add(3, SeqCst);
-                    results[0] = Some(ExternRef::new(CountDrops(num_dropped.clone()))).into();
-                    results[1] = Some(ExternRef::new(CountDrops(num_dropped.clone()))).into();
-                    results[2] = Some(ExternRef::new(CountDrops(num_dropped.clone()))).into();
-                    Ok(())
-                }
-            },
+        let func_ty = FuncType::new(
+            store.engine(),
+            vec![],
+            vec![ValType::EXTERNREF, ValType::EXTERNREF, ValType::EXTERNREF],
         );
+        let func = Func::new(&mut store, func_ty, {
+            let num_dropped = num_dropped.clone();
+            let expected_drops = expected_drops.clone();
+            move |_caller, _params, results| {
+                log::info!("table_ops: make_refs");
+                expected_drops.fetch_add(3, SeqCst);
+                results[0] = Some(ExternRef::new(CountDrops(num_dropped.clone()))).into();
+                results[1] = Some(ExternRef::new(CountDrops(num_dropped.clone()))).into();
+                results[2] = Some(ExternRef::new(CountDrops(num_dropped.clone()))).into();
+                Ok(())
+            }
+        });
         linker.define(&store, "", "make_refs", func).unwrap();
 
         let instance = linker.instantiate(&mut store, &module).unwrap();

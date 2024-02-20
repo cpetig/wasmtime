@@ -1,6 +1,3 @@
-use crate::memory::MemoryCreator;
-use crate::profiling_agent::{self, ProfilingAgent};
-use crate::trampoline::MemoryCreatorProxy;
 use anyhow::{bail, ensure, Result};
 use serde_derive::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -9,12 +6,20 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use target_lexicon::Architecture;
+use target_lexicon::{Architecture, PointerWidth};
 use wasmparser::WasmFeatures;
 #[cfg(feature = "cache")]
 use wasmtime_cache::CacheConfig;
 use wasmtime_environ::Tunables;
-use wasmtime_runtime::{mpk, InstanceAllocator, OnDemandInstanceAllocator, RuntimeMemoryCreator};
+
+#[cfg(feature = "runtime")]
+use crate::memory::MemoryCreator;
+#[cfg(feature = "runtime")]
+use crate::profiling_agent::{self, ProfilingAgent};
+#[cfg(feature = "runtime")]
+use crate::trampoline::MemoryCreatorProxy;
+#[cfg(feature = "runtime")]
+use wasmtime_runtime::{InstanceAllocator, OnDemandInstanceAllocator, RuntimeMemoryCreator};
 
 #[cfg(feature = "async")]
 use crate::stack::{StackCreator, StackCreatorProxy};
@@ -22,6 +27,9 @@ use crate::stack::{StackCreator, StackCreatorProxy};
 use wasmtime_fiber::RuntimeFiberStackCreator;
 
 pub use wasmtime_environ::CacheStore;
+#[cfg(feature = "pooling-allocator")]
+use wasmtime_runtime::mpk;
+#[cfg(feature = "pooling-allocator")]
 pub use wasmtime_runtime::MpkEnabled;
 
 /// Represents the module instance allocation strategy to use.
@@ -97,10 +105,11 @@ pub struct Config {
     #[cfg(any(feature = "cranelift", feature = "winch"))]
     compiler_config: CompilerConfig,
     profiling_strategy: ProfilingStrategy,
+    tunables: ConfigTunables,
 
-    pub(crate) tunables: Tunables,
     #[cfg(feature = "cache")]
     pub(crate) cache_config: CacheConfig,
+    #[cfg(feature = "runtime")]
     pub(crate) mem_creator: Option<Arc<dyn RuntimeMemoryCreator>>,
     pub(crate) allocation_strategy: InstanceAllocationStrategy,
     pub(crate) max_wasm_stack: usize,
@@ -121,6 +130,24 @@ pub struct Config {
     pub(crate) wmemcheck: bool,
     pub(crate) coredump_on_trap: bool,
     pub(crate) macos_use_mach_ports: bool,
+}
+
+#[derive(Default, Clone)]
+struct ConfigTunables {
+    static_memory_bound: Option<u64>,
+    static_memory_offset_guard_size: Option<u64>,
+    dynamic_memory_offset_guard_size: Option<u64>,
+    dynamic_memory_growth_reserve: Option<u64>,
+    generate_native_debuginfo: Option<bool>,
+    parse_wasm_debuginfo: Option<bool>,
+    consume_fuel: Option<bool>,
+    epoch_interruption: Option<bool>,
+    static_memory_bound_is_maximum: Option<bool>,
+    guard_before_linear_memory: Option<bool>,
+    generate_address_map: Option<bool>,
+    debug_adapter_modules: Option<bool>,
+    relaxed_simd_deterministic: Option<bool>,
+    tail_callable: Option<bool>,
 }
 
 /// User-provided configuration for the compiler.
@@ -183,12 +210,13 @@ impl Config {
     /// specified.
     pub fn new() -> Self {
         let mut ret = Self {
-            tunables: Tunables::default(),
+            tunables: ConfigTunables::default(),
             #[cfg(any(feature = "cranelift", feature = "winch"))]
             compiler_config: CompilerConfig::default(),
             #[cfg(feature = "cache")]
             cache_config: CacheConfig::new_cache_disabled(),
             profiling_strategy: ProfilingStrategy::None,
+            #[cfg(feature = "runtime")]
             mem_creator: None,
             allocation_strategy: InstanceAllocationStrategy::OnDemand,
             // 512k of stack -- note that this is chosen currently to not be too
@@ -216,7 +244,7 @@ impl Config {
             force_memory_init_memfd: false,
             wmemcheck: false,
             coredump_on_trap: false,
-            macos_use_mach_ports: true,
+            macos_use_mach_ports: !cfg!(miri),
         };
         #[cfg(any(feature = "cranelift", feature = "winch"))]
         {
@@ -252,7 +280,7 @@ impl Config {
     ///
     /// This method will error if the given target triple is not supported.
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    #[cfg_attr(nightlydoc, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
     pub fn target(&mut self, target: &str) -> Result<&mut Self> {
         self.compiler_config.target =
             Some(target_lexicon::Triple::from_str(target).map_err(|e| anyhow::anyhow!(e))?);
@@ -363,7 +391,7 @@ impl Config {
     /// it. If Wasmtime doesn't support exactly what you'd like just yet, please
     /// feel free to open an issue!
     #[cfg(feature = "async")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "async")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn async_support(&mut self, enable: bool) -> &mut Self {
         self.async_support = enable;
         self
@@ -378,7 +406,7 @@ impl Config {
     ///
     /// By default this option is `false`.
     pub fn debug_info(&mut self, enable: bool) -> &mut Self {
-        self.tunables.generate_native_debuginfo = enable;
+        self.tunables.generate_native_debuginfo = Some(enable);
         self
     }
 
@@ -425,13 +453,13 @@ impl Config {
     pub fn wasm_backtrace_details(&mut self, enable: WasmBacktraceDetails) -> &mut Self {
         self.wasm_backtrace_details_env_used = false;
         self.tunables.parse_wasm_debuginfo = match enable {
-            WasmBacktraceDetails::Enable => true,
-            WasmBacktraceDetails::Disable => false,
+            WasmBacktraceDetails::Enable => Some(true),
+            WasmBacktraceDetails::Disable => Some(false),
             WasmBacktraceDetails::Environment => {
                 self.wasm_backtrace_details_env_used = true;
                 std::env::var("WASMTIME_BACKTRACE_DETAILS")
-                    .map(|s| s == "1")
-                    .unwrap_or(false)
+                    .map(|s| Some(s == "1"))
+                    .unwrap_or(Some(false))
             }
         };
         self
@@ -474,7 +502,7 @@ impl Config {
     ///
     /// [`Store`]: crate::Store
     pub fn consume_fuel(&mut self, enable: bool) -> &mut Self {
-        self.tunables.consume_fuel = enable;
+        self.tunables.consume_fuel = Some(enable);
         self
     }
 
@@ -568,7 +596,7 @@ impl Config {
     /// - [`Store::epoch_deadline_callback`](crate::Store::epoch_deadline_callback)
     /// - [`Store::epoch_deadline_async_yield_and_update`](crate::Store::epoch_deadline_async_yield_and_update)
     pub fn epoch_interruption(&mut self, enable: bool) -> &mut Self {
-        self.tunables.epoch_interruption = enable;
+        self.tunables.epoch_interruption = Some(enable);
         self
     }
 
@@ -640,7 +668,7 @@ impl Config {
     /// The `Engine::new` method will fail if the value for this option is
     /// smaller than the [`Config::max_wasm_stack`] option.
     #[cfg(feature = "async")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "async")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn async_stack_size(&mut self, size: usize) -> &mut Self {
         self.async_stack_size = size;
         self
@@ -659,7 +687,7 @@ impl Config {
     /// [WebAssembly tail calls proposal]: https://github.com/WebAssembly/tail-call
     pub fn wasm_tail_call(&mut self, enable: bool) -> &mut Self {
         self.features.tail_call = enable;
-        self.tunables.tail_callable = enable;
+        self.tunables.tail_callable = Some(enable);
         self
     }
 
@@ -706,19 +734,41 @@ impl Config {
         self
     }
 
-    /// Configures whether the [WebAssembly function references proposal][proposal]
-    /// will be enabled for compilation.
+    /// Configures whether the [WebAssembly function references
+    /// proposal][proposal] will be enabled for compilation.
     ///
     /// This feature gates non-nullable reference types, function reference
-    /// types, call_ref, ref.func, and non-nullable reference related instructions.
+    /// types, `call_ref`, `ref.func`, and non-nullable reference related
+    /// instructions.
     ///
-    /// Note that the function references proposal depends on the reference types proposal.
+    /// Note that the function references proposal depends on the reference
+    /// types proposal.
     ///
     /// This feature is `false` by default.
     ///
     /// [proposal]: https://github.com/WebAssembly/function-references
     pub fn wasm_function_references(&mut self, enable: bool) -> &mut Self {
         self.features.function_references = enable;
+        self
+    }
+
+    /// Configures whether the [WebAssembly Garbage Collection
+    /// proposal][proposal] will be enabled for compilation.
+    ///
+    /// This feature gates `struct` and `array` type definitions and references,
+    /// the `i31ref` type, and all related instructions.
+    ///
+    /// Note that the function references proposal depends on the typed function
+    /// references proposal.
+    ///
+    /// This feature is `false` by default.
+    ///
+    /// **Warning: Wasmtime's implementation of the GC proposal is still in
+    /// progress and generally not ready for primetime.**
+    ///
+    /// [proposal]: https://github.com/WebAssembly/gc
+    pub fn wasm_gc(&mut self, enable: bool) -> &mut Self {
+        self.features.gc = enable;
         self
     }
 
@@ -786,7 +836,7 @@ impl Config {
     ///
     /// [proposal]: https://github.com/webassembly/relaxed-simd
     pub fn relaxed_simd_deterministic(&mut self, enable: bool) -> &mut Self {
-        self.tunables.relaxed_simd_deterministic = enable;
+        self.tunables.relaxed_simd_deterministic = Some(enable);
         self
     }
 
@@ -878,7 +928,7 @@ impl Config {
     ///
     /// The default value for this is `Strategy::Auto`.
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    #[cfg_attr(nightlydoc, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
     pub fn strategy(&mut self, strategy: Strategy) -> &mut Self {
         self.compiler_config.strategy = strategy;
         self
@@ -912,7 +962,7 @@ impl Config {
     ///
     /// The default value for this is `false`
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    #[cfg_attr(nightlydoc, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
     pub fn cranelift_debug_verifier(&mut self, enable: bool) -> &mut Self {
         let val = if enable { "true" } else { "false" };
         self.compiler_config
@@ -929,7 +979,7 @@ impl Config {
     ///
     /// The default value for this is `OptLevel::None`.
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    #[cfg_attr(nightlydoc, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
     pub fn cranelift_opt_level(&mut self, level: OptLevel) -> &mut Self {
         let val = match level {
             OptLevel::None => "none",
@@ -951,7 +1001,7 @@ impl Config {
     ///
     /// The default value for this is `false`
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    #[cfg_attr(nightlydoc, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
     pub fn cranelift_nan_canonicalization(&mut self, enable: bool) -> &mut Self {
         let val = if enable { "true" } else { "false" };
         self.compiler_config
@@ -974,7 +1024,7 @@ impl Config {
     /// over a trail of "breadcrumbs" or facts at each intermediate
     /// value. Thus, it is appropriate to enable in production.
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    #[cfg_attr(nightlydoc, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
     pub fn cranelift_pcc(&mut self, enable: bool) -> &mut Self {
         let val = if enable { "true" } else { "false" };
         self.compiler_config
@@ -1000,7 +1050,7 @@ impl Config {
     /// cause `Engine::new` fail if the flag's name does not exist, or the value is not appropriate
     /// for the flag type.
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    #[cfg_attr(nightlydoc, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
     pub unsafe fn cranelift_flag_enable(&mut self, flag: &str) -> &mut Self {
         self.compiler_config.flags.insert(flag.to_string());
         self
@@ -1026,7 +1076,7 @@ impl Config {
     /// For example, feature `wasm_backtrace` will set `unwind_info` to `true`, but if it's
     /// manually set to false then it will fail.
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    #[cfg_attr(nightlydoc, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "cranelift", feature = "winch"))))]
     pub unsafe fn cranelift_flag_set(&mut self, name: &str, value: &str) -> &mut Self {
         self.compiler_config
             .settings
@@ -1053,7 +1103,7 @@ impl Config {
     ///
     /// [docs]: https://bytecodealliance.github.io/wasmtime/cli-cache.html
     #[cfg(feature = "cache")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "cache")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cache")))]
     pub fn cache_config_load(&mut self, path: impl AsRef<Path>) -> Result<&mut Self> {
         self.cache_config = CacheConfig::from_file(Some(path.as_ref()))?;
         Ok(self)
@@ -1070,7 +1120,7 @@ impl Config {
     /// This method is only available when the `cache` feature of this crate is
     /// enabled.
     #[cfg(feature = "cache")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "cache")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cache")))]
     pub fn disable_cache(&mut self) -> &mut Self {
         self.cache_config = CacheConfig::new_cache_disabled();
         self
@@ -1098,7 +1148,7 @@ impl Config {
     ///
     /// [docs]: https://bytecodealliance.github.io/wasmtime/cli-cache.html
     #[cfg(feature = "cache")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "cache")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cache")))]
     pub fn cache_config_load_default(&mut self) -> Result<&mut Self> {
         self.cache_config = CacheConfig::from_file(None)?;
         Ok(self)
@@ -1108,6 +1158,7 @@ impl Config {
     ///
     /// Custom memory creators are used when creating host `Memory` objects or when
     /// creating instance linear memories for the on-demand instance allocation strategy.
+    #[cfg(feature = "runtime")]
     pub fn with_host_memory(&mut self, mem_creator: Arc<dyn MemoryCreator>) -> &mut Self {
         self.mem_creator = Some(Arc::new(MemoryCreatorProxy(mem_creator)));
         self
@@ -1118,7 +1169,7 @@ impl Config {
     /// Custom memory creators are used when creating creating async instance stacks for
     /// the on-demand instance allocation strategy.
     #[cfg(feature = "async")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "async")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn with_host_stack(&mut self, stack_creator: Arc<dyn StackCreator>) -> &mut Self {
         self.stack_creator = Some(Arc::new(StackCreatorProxy(stack_creator)));
         self
@@ -1230,7 +1281,7 @@ impl Config {
     /// `PoolingAllocatorConfig::memory_protection_keys` for details.
     pub fn static_memory_maximum_size(&mut self, max_size: u64) -> &mut Self {
         let max_pages = max_size / u64::from(wasmtime_environ::WASM_PAGE_SIZE);
-        self.tunables.static_memory_bound = max_pages;
+        self.tunables.static_memory_bound = Some(max_pages);
         self
     }
 
@@ -1246,7 +1297,7 @@ impl Config {
     /// For the difference between static and dynamic memories, see the
     /// [`Config::static_memory_maximum_size`].
     pub fn static_memory_forced(&mut self, force: bool) -> &mut Self {
-        self.tunables.static_memory_bound_is_maximum = force;
+        self.tunables.static_memory_bound_is_maximum = Some(force);
         self
     }
 
@@ -1302,7 +1353,7 @@ impl Config {
     /// than the value configured for [`Config::dynamic_memory_guard_size`].
     pub fn static_memory_guard_size(&mut self, guard_size: u64) -> &mut Self {
         let guard_size = round_up_to_pages(guard_size);
-        self.tunables.static_memory_offset_guard_size = guard_size;
+        self.tunables.static_memory_offset_guard_size = Some(guard_size);
         self
     }
 
@@ -1335,7 +1386,7 @@ impl Config {
     /// than the value configured for [`Config::static_memory_guard_size`].
     pub fn dynamic_memory_guard_size(&mut self, guard_size: u64) -> &mut Self {
         let guard_size = round_up_to_pages(guard_size);
-        self.tunables.dynamic_memory_offset_guard_size = guard_size;
+        self.tunables.dynamic_memory_offset_guard_size = Some(guard_size);
         self
     }
 
@@ -1374,7 +1425,7 @@ impl Config {
     /// For 64-bit platforms this defaults to 2GB, and for 32-bit platforms this
     /// defaults to 1MB.
     pub fn dynamic_memory_reserved_for_growth(&mut self, reserved: u64) -> &mut Self {
-        self.tunables.dynamic_memory_growth_reserve = round_up_to_pages(reserved);
+        self.tunables.dynamic_memory_growth_reserve = Some(round_up_to_pages(reserved));
         self
     }
 
@@ -1399,7 +1450,7 @@ impl Config {
     ///
     /// This value defaults to `true`.
     pub fn guard_before_linear_memory(&mut self, guard: bool) -> &mut Self {
-        self.tunables.guard_before_linear_memory = guard;
+        self.tunables.guard_before_linear_memory = Some(guard);
         self
     }
 
@@ -1430,7 +1481,7 @@ impl Config {
     ///
     /// By default parallel compilation is enabled.
     #[cfg(feature = "parallel-compilation")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "parallel-compilation")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "parallel-compilation")))]
     pub fn parallel_compilation(&mut self, parallel: bool) -> &mut Self {
         self.parallel_compilation = parallel;
         self
@@ -1446,7 +1497,7 @@ impl Config {
     /// numbers if so configured as well (and the original wasm module has DWARF
     /// debugging information present).
     pub fn generate_address_map(&mut self, generate: bool) -> &mut Self {
-        self.tunables.generate_address_map = generate;
+        self.tunables.generate_address_map = Some(generate);
         self
     }
 
@@ -1524,7 +1575,7 @@ impl Config {
     ///
     /// This option is disabled by default.
     #[cfg(feature = "coredump")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "coredump")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "coredump")))]
     pub fn coredump_on_trap(&mut self, enable: bool) -> &mut Self {
         self.coredump_on_trap = enable;
         self
@@ -1580,12 +1631,18 @@ impl Config {
         self
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<Tunables> {
         if self.features.reference_types && !self.features.bulk_memory {
             bail!("feature 'reference_types' requires 'bulk_memory' to be enabled");
         }
         if self.features.threads && !self.features.bulk_memory {
             bail!("feature 'threads' requires 'bulk_memory' to be enabled");
+        }
+        if self.features.function_references && !self.features.reference_types {
+            bail!("feature 'function_references' requires 'reference_types' to be enabled");
+        }
+        if self.features.gc && !self.features.function_references {
+            bail!("feature 'gc' requires 'function_references' to be enabled");
         }
         #[cfg(feature = "async")]
         if self.async_support && self.max_wasm_stack > self.async_stack_size {
@@ -1594,25 +1651,72 @@ impl Config {
         if self.max_wasm_stack == 0 {
             bail!("max_wasm_stack size cannot be zero");
         }
-        if self.tunables.static_memory_offset_guard_size
-            < self.tunables.dynamic_memory_offset_guard_size
-        {
-            bail!("static memory guard size cannot be smaller than dynamic memory guard size");
-        }
         #[cfg(not(feature = "wmemcheck"))]
         if self.wmemcheck {
             bail!("wmemcheck (memory checker) was requested but is not enabled in this build");
         }
 
-        Ok(())
+        #[cfg(not(any(feature = "cranelift", feature = "winch")))]
+        let mut tunables = Tunables::default_host();
+        #[cfg(any(feature = "cranelift", feature = "winch"))]
+        let mut tunables = match &self.compiler_config.target.as_ref() {
+            Some(target) => match target.pointer_width() {
+                Ok(PointerWidth::U32) => Tunables::default_u32(),
+                Ok(PointerWidth::U64) => Tunables::default_u64(),
+                _ => bail!("unknown pointer width"),
+            },
+            None => Tunables::default_host(),
+        };
+
+        macro_rules! set_fields {
+            ($($field:ident)*) => (
+                let ConfigTunables {
+                    $($field,)*
+                } = &self.tunables;
+
+                $(
+                    if let Some(e) = $field {
+                        tunables.$field = *e;
+                    }
+                )*
+            )
+        }
+
+        set_fields! {
+            static_memory_bound
+            static_memory_offset_guard_size
+            dynamic_memory_offset_guard_size
+            dynamic_memory_growth_reserve
+            generate_native_debuginfo
+            parse_wasm_debuginfo
+            consume_fuel
+            epoch_interruption
+            static_memory_bound_is_maximum
+            guard_before_linear_memory
+            generate_address_map
+            debug_adapter_modules
+            relaxed_simd_deterministic
+            tail_callable
+        }
+
+        if tunables.static_memory_offset_guard_size < tunables.dynamic_memory_offset_guard_size {
+            bail!("static memory guard size cannot be smaller than dynamic memory guard size");
+        }
+        Ok(tunables)
     }
 
-    pub(crate) fn build_allocator(&self) -> Result<Box<dyn InstanceAllocator + Send + Sync>> {
+    #[cfg(feature = "runtime")]
+    pub(crate) fn build_allocator(
+        &self,
+        tunables: &Tunables,
+    ) -> Result<Box<dyn InstanceAllocator + Send + Sync>> {
         #[cfg(feature = "async")]
         let stack_size = self.async_stack_size;
 
         #[cfg(not(feature = "async"))]
         let stack_size = 0;
+
+        let _ = tunables;
 
         match &self.allocation_strategy {
             InstanceAllocationStrategy::OnDemand => {
@@ -1632,13 +1736,13 @@ impl Config {
                 let mut config = config.config;
                 config.stack_size = stack_size;
                 Ok(Box::new(wasmtime_runtime::PoolingInstanceAllocator::new(
-                    &config,
-                    &self.tunables,
+                    &config, tunables,
                 )?))
             }
         }
     }
 
+    #[cfg(feature = "runtime")]
     pub(crate) fn build_profiler(&self) -> Result<Box<dyn ProfilingAgent>> {
         Ok(match self.profiling_strategy {
             ProfilingStrategy::PerfMap => profiling_agent::new_perfmap()?,
@@ -1649,25 +1753,26 @@ impl Config {
     }
 
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    pub(crate) fn build_compiler(mut self) -> Result<(Self, Box<dyn wasmtime_environ::Compiler>)> {
+    pub(crate) fn build_compiler(
+        mut self,
+        tunables: &Tunables,
+    ) -> Result<(Self, Box<dyn wasmtime_environ::Compiler>)> {
+        let target = self.compiler_config.target.clone();
+
         let mut compiler = match self.compiler_config.strategy {
             #[cfg(feature = "cranelift")]
-            Strategy::Auto => wasmtime_cranelift::builder(),
+            Strategy::Auto => wasmtime_cranelift::builder(target)?,
             #[cfg(all(feature = "winch", not(feature = "cranelift")))]
-            Strategy::Auto => wasmtime_winch::builder(),
+            Strategy::Auto => wasmtime_winch::builder(target)?,
             #[cfg(feature = "cranelift")]
-            Strategy::Cranelift => wasmtime_cranelift::builder(),
+            Strategy::Cranelift => wasmtime_cranelift::builder(target)?,
             #[cfg(not(feature = "cranelift"))]
             Strategy::Cranelift => bail!("cranelift support not compiled in"),
             #[cfg(feature = "winch")]
-            Strategy::Winch => wasmtime_winch::builder(),
+            Strategy::Winch => wasmtime_winch::builder(target)?,
             #[cfg(not(feature = "winch"))]
             Strategy::Winch => bail!("winch support not compiled in"),
         };
-
-        if let Some(target) = &self.compiler_config.target {
-            compiler.target(target.clone())?;
-        }
 
         if let Some(path) = &self.compiler_config.clif_dir {
             compiler.clif_dir(path)?;
@@ -1758,7 +1863,7 @@ impl Config {
             compiler.enable_incremental_compilation(cache_store.clone())?;
         }
 
-        compiler.set_tunables(self.tunables.clone())?;
+        compiler.set_tunables(tunables.clone())?;
         compiler.wmemcheck(self.compiler_config.wmemcheck);
 
         Ok((self, compiler.build()?))
@@ -1769,7 +1874,7 @@ impl Config {
     /// then are necessary.
     #[cfg(feature = "component-model")]
     pub fn debug_adapter_modules(&mut self, debug: bool) -> &mut Self {
-        self.tunables.debug_adapter_modules = debug;
+        self.tunables.debug_adapter_modules = Some(debug);
         self
     }
 
@@ -1813,6 +1918,15 @@ impl Config {
     }
 }
 
+/// If building without the runtime feature we can't determine the page size of
+/// the platform where the execution will happen so just keep the original
+/// values.
+#[cfg(not(feature = "runtime"))]
+fn round_up_to_pages(val: u64) -> u64 {
+    val
+}
+
+#[cfg(feature = "runtime")]
 fn round_up_to_pages(val: u64) -> u64 {
     let page_size = wasmtime_runtime::page_size() as u64;
     debug_assert!(page_size.is_power_of_two());
@@ -1831,38 +1945,40 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut f = f.debug_struct("Config");
         f.field("debug_info", &self.tunables.generate_native_debuginfo)
-            .field("parse_wasm_debuginfo", &self.tunables.parse_wasm_debuginfo)
             .field("wasm_threads", &self.features.threads)
             .field("wasm_reference_types", &self.features.reference_types)
             .field(
                 "wasm_function_references",
                 &self.features.function_references,
             )
+            .field("wasm_gc", &self.features.gc)
             .field("wasm_bulk_memory", &self.features.bulk_memory)
             .field("wasm_simd", &self.features.simd)
             .field("wasm_relaxed_simd", &self.features.relaxed_simd)
             .field("wasm_multi_value", &self.features.multi_value)
-            .field(
-                "static_memory_maximum_size",
-                &(u64::from(self.tunables.static_memory_bound)
-                    * u64::from(wasmtime_environ::WASM_PAGE_SIZE)),
-            )
-            .field(
-                "static_memory_guard_size",
-                &self.tunables.static_memory_offset_guard_size,
-            )
-            .field(
-                "dynamic_memory_guard_size",
-                &self.tunables.dynamic_memory_offset_guard_size,
-            )
-            .field(
-                "guard_before_linear_memory",
-                &self.tunables.guard_before_linear_memory,
-            )
             .field("parallel_compilation", &self.parallel_compilation);
         #[cfg(any(feature = "cranelift", feature = "winch"))]
         {
             f.field("compiler_config", &self.compiler_config);
+        }
+
+        if let Some(enable) = self.tunables.parse_wasm_debuginfo {
+            f.field("parse_wasm_debuginfo", &enable);
+        }
+        if let Some(size) = self.tunables.static_memory_bound {
+            f.field(
+                "static_memory_maximum_size",
+                &(u64::from(size) * u64::from(wasmtime_environ::WASM_PAGE_SIZE)),
+            );
+        }
+        if let Some(size) = self.tunables.static_memory_offset_guard_size {
+            f.field("static_memory_guard_size", &size);
+        }
+        if let Some(size) = self.tunables.dynamic_memory_offset_guard_size {
+            f.field("dynamic_memory_guard_size", &size);
+        }
+        if let Some(enable) = self.tunables.guard_before_linear_memory {
+            f.field("guard_before_linear_memory", &enable);
         }
         f.finish()
     }
@@ -2030,7 +2146,7 @@ impl PoolingAllocationConfig {
     ///
     /// [`call_async`]: crate::TypedFunc::call_async
     #[cfg(feature = "async")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "async")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn async_stack_zeroing(&mut self, enable: bool) -> &mut Self {
         self.config.async_stack_zeroing = enable;
         self
@@ -2048,7 +2164,7 @@ impl PoolingAllocationConfig {
     /// Note that when using this option the memory with async stacks will
     /// never be decommitted.
     #[cfg(feature = "async")]
-    #[cfg_attr(nightlydoc, doc(cfg(feature = "async")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
     pub fn async_stack_keep_resident(&mut self, size: usize) -> &mut Self {
         let size = round_up_to_pages(size as u64) as usize;
         self.config.async_stack_keep_resident = size;

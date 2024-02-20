@@ -780,8 +780,7 @@ fn write_bytes<'a>(
 ) -> Result<GuestPtr<'a, u8>, types::Error> {
     // NOTE: legacy implementation always returns Inval errno
 
-    let buf = buf.as_ref();
-    let len = buf.len().try_into()?;
+    let len = u32::try_from(buf.len())?;
 
     let ptr = ptr.borrow();
     ptr.as_array(len).copy_from_slice(buf)?;
@@ -821,17 +820,14 @@ fn first_non_empty_ciovec<'a, 'b>(
 
 // Find first non-empty buffer.
 fn first_non_empty_iovec<'a>(iovs: &types::IovecArray<'a>) -> Result<Option<GuestPtr<'a, [u8]>>> {
-    iovs.iter()
-        .map(|iov| {
-            let iov = iov?.read()?;
-            if iov.buf_len == 0 {
-                return Ok(None);
-            }
-            let slice = iov.buf.as_array(iov.buf_len);
-            Ok(Some(slice))
-        })
-        .find_map(Result::transpose)
-        .transpose()
+    for iov in iovs.iter() {
+        let iov = iov?.read()?;
+        if iov.buf_len == 0 {
+            continue;
+        }
+        return Ok(Some(iov.buf.as_array(iov.buf_len)));
+    }
+    Ok(None)
 }
 
 #[async_trait::async_trait]

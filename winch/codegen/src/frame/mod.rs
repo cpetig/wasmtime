@@ -6,7 +6,7 @@ use anyhow::Result;
 use smallvec::SmallVec;
 use std::ops::Range;
 use wasmparser::{BinaryReader, FuncValidator, ValidatorResources};
-use wasmtime_environ::{TypeConvert, WasmType};
+use wasmtime_environ::{TypeConvert, WasmValType};
 
 // TODO:
 // SpiderMonkey's implementation uses 16;
@@ -40,7 +40,7 @@ impl DefinedLocals {
         reader: &mut BinaryReader<'_>,
         validator: &mut FuncValidator<ValidatorResources>,
     ) -> Result<Self> {
-        let mut next_stack = 0;
+        let mut next_stack: u32 = 0;
         // The first 32 bits of a Wasm binary function describe the number of locals.
         let local_count = reader.read_var_u32()?;
         let mut slots: Locals = Default::default();
@@ -54,7 +54,7 @@ impl DefinedLocals {
             let ty = types.convert_valtype(ty);
             for _ in 0..count {
                 let ty_size = <A as ABI>::sizeof(&ty);
-                next_stack = align_to(next_stack, ty_size) + ty_size;
+                next_stack = align_to(next_stack, ty_size as u32) + (ty_size as u32);
                 slots.push(LocalSlot::new(ty, next_stack));
             }
         }
@@ -102,7 +102,7 @@ impl Frame {
         );
 
         // Align the locals to add a slot for the VMContext pointer.
-        let ptr_size = <A as ABI>::word_bytes();
+        let ptr_size = <A as ABI>::word_bytes() as u32;
         let vmctx_offset =
             align_to(defined_locals_start + defined_locals.stack_size, ptr_size) + ptr_size;
 
@@ -154,7 +154,7 @@ impl Frame {
         &self,
         index: u32,
         masm: &mut M,
-    ) -> (WasmType, M::Address) {
+    ) -> (WasmValType, M::Address) {
         self.get_local(index)
             .map(|slot| (slot.ty, masm.local_address(slot)))
             .unwrap_or_else(|| panic!("Invalid local slot: {}", index))

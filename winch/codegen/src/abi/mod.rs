@@ -47,7 +47,7 @@ use crate::masm::{OperandSize, SPOffset};
 use smallvec::SmallVec;
 use std::collections::HashSet;
 use std::ops::{Add, BitAnd, Not, Sub};
-use wasmtime_environ::{WasmFuncType, WasmHeapType, WasmRefType, WasmType};
+use wasmtime_environ::{WasmFuncType, WasmHeapType, WasmRefType, WasmValType};
 
 pub(crate) mod local;
 pub(crate) use local::*;
@@ -81,17 +81,20 @@ pub(crate) trait ABI {
     fn sig(wasm_sig: &WasmFuncType, call_conv: &CallingConvention) -> ABISig;
 
     /// Construct an ABI signature from WasmType params and returns.
-    fn sig_from(params: &[WasmType], returns: &[WasmType], call_conv: &CallingConvention)
-        -> ABISig;
+    fn sig_from(
+        params: &[WasmValType],
+        returns: &[WasmValType],
+        call_conv: &CallingConvention,
+    ) -> ABISig;
 
     /// Construct [`ABIResults`] from a slice of [`WasmType`].
-    fn abi_results(returns: &[WasmType], call_conv: &CallingConvention) -> ABIResults;
+    fn abi_results(returns: &[WasmValType], call_conv: &CallingConvention) -> ABIResults;
 
     /// Returns the number of bits in a word.
-    fn word_bits() -> u32;
+    fn word_bits() -> u8;
 
     /// Returns the number of bytes in a word.
-    fn word_bytes() -> u32 {
+    fn word_bytes() -> u8 {
         Self::word_bits() / 8
     }
 
@@ -102,15 +105,15 @@ pub(crate) trait ABI {
     fn float_scratch_reg() -> Reg;
 
     /// Returns the designated scratch register for the given [WasmType].
-    fn scratch_for(ty: &WasmType) -> Reg {
+    fn scratch_for(ty: &WasmValType) -> Reg {
         match ty {
-            WasmType::I32
-            | WasmType::I64
-            | WasmType::Ref(WasmRefType {
+            WasmValType::I32
+            | WasmValType::I64
+            | WasmValType::Ref(WasmRefType {
                 heap_type: WasmHeapType::Func,
                 ..
             }) => Self::scratch_reg(),
-            WasmType::F32 | WasmType::F64 => Self::float_scratch_reg(),
+            WasmValType::F32 | WasmValType::F64 => Self::float_scratch_reg(),
             _ => unimplemented!(),
         }
     }
@@ -130,10 +133,13 @@ pub(crate) trait ABI {
     fn callee_saved_regs(call_conv: &CallingConvention) -> SmallVec<[(Reg, OperandSize); 18]>;
 
     /// The size, in bytes, of each stack slot used for stack parameter passing.
-    fn stack_slot_size() -> u32;
+    fn stack_slot_size() -> u8;
 
     /// Returns the size in bytes of the given [`WasmType`].
-    fn sizeof(ty: &WasmType) -> u32;
+    fn sizeof(ty: &WasmValType) -> u8;
+
+    /// Returns the size in bits of the given [`WasmType`].
+    fn sizeof_bits(ty: &WasmValType) -> u8;
 }
 
 /// ABI-specific representation of function argument or result.
@@ -142,7 +148,7 @@ pub enum ABIOperand {
     /// A register [`ABIOperand`].
     Reg {
         /// The type of the [`ABIOperand`].
-        ty: WasmType,
+        ty: WasmValType,
         /// Register holding the [`ABIOperand`].
         reg: Reg,
         /// The size of the [`ABIOperand`], in bytes.
@@ -151,7 +157,7 @@ pub enum ABIOperand {
     /// A stack [`ABIOperand`].
     Stack {
         /// The type of the [`ABIOperand`].
-        ty: WasmType,
+        ty: WasmValType,
         /// Offset of the operand referenced through FP by the callee and
         /// through SP by the caller.
         offset: u32,
@@ -162,12 +168,12 @@ pub enum ABIOperand {
 
 impl ABIOperand {
     /// Allocate a new register [`ABIOperand`].
-    pub fn reg(reg: Reg, ty: WasmType, size: u32) -> Self {
+    pub fn reg(reg: Reg, ty: WasmValType, size: u32) -> Self {
         Self::Reg { reg, ty, size }
     }
 
     /// Allocate a new stack [`ABIOperand`].
-    pub fn stack_offset(offset: u32, ty: WasmType, size: u32) -> Self {
+    pub fn stack_offset(offset: u32, ty: WasmValType, size: u32) -> Self {
         Self::Stack { ty, offset, size }
     }
 
@@ -199,7 +205,7 @@ impl ABIOperand {
     }
 
     /// Get the type associated to this [`ABIOperand`].
-    pub fn ty(&self) -> WasmType {
+    pub fn ty(&self) -> WasmValType {
         match *self {
             ABIOperand::Reg { ty, .. } | ABIOperand::Stack { ty, .. } => ty,
         }
@@ -307,9 +313,9 @@ impl ABIResults {
     /// representation, according to the calling convention. In the case of
     /// results, one result is stored in registers and the rest at particular
     /// offsets in the stack.
-    pub fn from<F>(returns: &[WasmType], call_conv: &CallingConvention, mut map: F) -> Self
+    pub fn from<F>(returns: &[WasmValType], call_conv: &CallingConvention, mut map: F) -> Self
     where
-        F: FnMut(&WasmType, u32) -> (ABIOperand, u32),
+        F: FnMut(&WasmValType, u32) -> (ABIOperand, u32),
     {
         if returns.len() == 0 {
             return Self::default();
@@ -452,13 +458,13 @@ impl ABIParams {
     /// params, multiple params may be passed in registers and the rest on the
     /// stack depending on the calling convention.
     pub fn from<F, A: ABI>(
-        params: &[WasmType],
+        params: &[WasmValType],
         initial_bytes: u32,
         needs_stack_results: bool,
         mut map: F,
     ) -> Self
     where
-        F: FnMut(&WasmType, u32) -> (ABIOperand, u32),
+        F: FnMut(&WasmValType, u32) -> (ABIOperand, u32),
     {
         if params.len() == 0 && !needs_stack_results {
             return Self::with_bytes(initial_bytes);
@@ -485,7 +491,7 @@ impl ABIParams {
             },
         );
 
-        let ptr_type = ptr_type_from_ptr_size(<A as ABI>::word_bytes() as u8);
+        let ptr_type = ptr_type_from_ptr_size(<A as ABI>::word_bytes());
         // Handle stack results by specifying an extra, implicit last argument.
         if needs_stack_results {
             let (operand, bytes) = map(&ptr_type, stack_bytes);

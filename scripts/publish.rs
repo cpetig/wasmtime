@@ -63,14 +63,14 @@ const CRATES_TO_PUBLISH: &[&str] = &[
     // wasi-common/wiggle
     "wiggle",
     "wasi-common",
-    "wasi-cap-std-sync",
-    "wasi-tokio",
     // other misc wasmtime crates
     "wasmtime-wasi",
     "wasmtime-wasi-http",
     "wasmtime-wasi-nn",
     "wasmtime-wasi-threads",
     "wasmtime-wast",
+    "wasmtime-c-api-macros",
+    "wasmtime-c-api-impl",
     "wasmtime-cli-flags",
     "wasmtime-explorer",
     "wasmtime-cli",

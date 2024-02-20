@@ -19,7 +19,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use smallvec::SmallVec;
 use std::mem;
-use wasmtime_environ::{FuncIndex, PtrSize, WasmFuncType, WasmType};
+use wasmtime_environ::{FuncIndex, PtrSize, WasmFuncType, WasmValType};
 
 /// The supported trampoline kinds.
 /// See <https://github.com/bytecodealliance/rfcs/blob/main/accepted/tail-calls.md#new-trampolines-and-vmcallercheckedanyfunc-changes>
@@ -60,7 +60,7 @@ where
     /// The pointer size of the current ISA.
     pointer_size: M::Ptr,
     /// WasmType representation of the pointer size.
-    pointer_type: WasmType,
+    pointer_type: WasmValType,
 }
 
 impl<'a, M> Trampoline<'a, M>
@@ -88,7 +88,7 @@ where
     }
 
     /// Emit an array-to-wasm trampoline.
-    pub fn emit_array_to_wasm(&mut self, ty: &WasmFuncType, callee_index: FuncIndex) -> Result<()> {
+    pub fn emit_array_to_wasm(mut self, ty: &WasmFuncType, callee_index: FuncIndex) -> Result<()> {
         let array_sig = self.array_sig();
         let wasm_sig = self.wasm_sig(ty);
 
@@ -145,11 +145,8 @@ where
         // Move the val ptr back into the scratch register so we can
         // load the return values.
         let val_ptr_offset = offsets[2];
-        self.masm.load(
-            self.masm.address_from_sp(val_ptr_offset),
-            self.scratch_reg,
-            OperandSize::S64,
-        );
+        self.masm
+            .load_ptr(self.masm.address_from_sp(val_ptr_offset), self.scratch_reg);
 
         self.store_results_to_array(&wasm_sig, ret_area.as_ref());
 
@@ -180,7 +177,8 @@ where
                         }
                         _ => unreachable!(),
                     };
-                    self.masm.load(addr, self.alloc_scratch_reg, (*ty).into());
+                    let size: OperandSize = (*ty).into();
+                    self.masm.load(addr, self.alloc_scratch_reg, size);
                     self.masm.store(
                         self.alloc_scratch_reg.into(),
                         self.masm.address_at_reg(self.scratch_reg, value_offset),
@@ -192,11 +190,7 @@ where
     }
 
     /// Emit a native-to-wasm trampoline.
-    pub fn emit_native_to_wasm(
-        &mut self,
-        ty: &WasmFuncType,
-        callee_index: FuncIndex,
-    ) -> Result<()> {
+    pub fn emit_native_to_wasm(mut self, ty: &WasmFuncType, callee_index: FuncIndex) -> Result<()> {
         let native_sig = self.native_sig(&ty);
         let wasm_sig = self.wasm_sig(&ty);
         let (vmctx, caller_vmctx) = Self::callee_and_caller_vmctx(&native_sig.params)?;
@@ -294,12 +288,14 @@ where
             match caller_sig.params.unwrap_results_area_operand() {
                 ABIOperand::Reg { ty, .. } => {
                     let addr = self.masm.address_from_sp(*caller_retptr_offset.unwrap());
-                    self.masm.load(addr, self.scratch_reg, (*ty).into());
+                    let size: OperandSize = (*ty).into();
+                    self.masm.load(addr, self.scratch_reg, size);
                     self.scratch_reg
                 }
                 ABIOperand::Stack { ty, offset, .. } => {
+                    let size: OperandSize = (*ty).into();
                     let addr = self.masm.address_at_reg(fp, arg_base + offset);
-                    self.masm.load(addr, self.scratch_reg, (*ty).into());
+                    self.masm.load(addr, self.scratch_reg, size);
                     self.scratch_reg
                 }
             }
@@ -311,10 +307,11 @@ where
             match (callee_operand, caller_operand) {
                 (ABIOperand::Reg { ty, .. }, ABIOperand::Stack { offset, .. }) => {
                     let reg_offset = spill_offsets_iter.next().unwrap();
+                    let size: OperandSize = (*ty).into();
                     self.masm.load(
                         self.masm.address_from_sp(*reg_offset),
                         self.alloc_scratch_reg,
-                        (*ty).into(),
+                        size,
                     );
                     self.masm.store(
                         self.alloc_scratch_reg.into(),
@@ -334,8 +331,9 @@ where
                         let slot_offset = base.as_u32() - *offset;
                         self.masm.address_from_sp(SPOffset::from_u32(slot_offset))
                     };
+                    let size: OperandSize = (*ty).into();
 
-                    self.masm.load(addr, self.alloc_scratch_reg, (*ty).into());
+                    self.masm.load(addr, self.alloc_scratch_reg, size);
                     self.masm.store(
                         self.alloc_scratch_reg.into(),
                         self.masm
@@ -354,11 +352,8 @@ where
                 }
                 (ABIOperand::Reg { ty, .. }, ABIOperand::Reg { reg: dst, .. }) => {
                     let spill_offset = spill_offsets_iter.next().unwrap();
-                    self.masm.load(
-                        self.masm.address_from_sp(*spill_offset),
-                        (*dst).into(),
-                        (*ty).into(),
-                    );
+                    self.masm
+                        .load(self.masm.address_from_sp(*spill_offset), *dst, (*ty).into());
                 }
             }
         }
@@ -366,7 +361,7 @@ where
     }
 
     /// Emit a wasm-to-native trampoline.
-    pub fn emit_wasm_to_native(&mut self, ty: &WasmFuncType) -> Result<()> {
+    pub fn emit_wasm_to_native(mut self, ty: &WasmFuncType) -> Result<()> {
         let mut params = self.callee_and_caller_vmctx_types();
         params.extend_from_slice(ty.params());
 
@@ -415,7 +410,7 @@ where
             let body_offset = self.pointer_size.vmnative_call_host_func_context_func_ref()
                 + self.pointer_size.vm_func_ref_native_call();
             let callee_addr = masm.address_at_reg(self.alloc_scratch_reg, body_offset.into());
-            masm.load(callee_addr, self.scratch_reg, OperandSize::S64);
+            masm.load_ptr(callee_addr, self.scratch_reg);
 
             CalleeKind::Indirect(self.scratch_reg)
         });
@@ -461,7 +456,8 @@ where
                     (ABIOperand::Stack { ty, offset, .. }, ABIOperand::Reg { .. }) => {
                         let spill_offset = caller_stack_offsets[offset_index];
                         let addr = masm.address_from_sp(spill_offset);
-                        masm.load(addr, scratch, (*ty).into());
+                        let size: OperandSize = (*ty).into();
+                        masm.load(addr, scratch, size);
 
                         let arg_addr = masm.address_at_sp(SPOffset::from_u32(*offset));
                         masm.store(scratch.into(), arg_addr, (*ty).into());
@@ -495,7 +491,7 @@ where
     }
 
     /// Get the type of the caller and callee VM contexts.
-    fn callee_and_caller_vmctx_types(&self) -> SmallVec<[WasmType; 2]> {
+    fn callee_and_caller_vmctx_types(&self) -> SmallVec<[WasmValType; 2]> {
         std::iter::repeat(self.pointer_type).take(2).collect()
     }
 
@@ -660,7 +656,7 @@ where
         ptr: &impl PtrSize,
     ) {
         let sp = <M::ABI as ABI>::sp_reg();
-        masm.load(vm_runtime_limits_addr, scratch, OperandSize::S64);
+        masm.load_ptr(vm_runtime_limits_addr, scratch);
         let addr = masm.address_at_reg(scratch, ptr.vmruntime_limits_last_wasm_entry_sp().into());
         masm.store(sp.into(), addr, OperandSize::S64);
     }
@@ -672,7 +668,7 @@ where
         alloc_scratch: Reg,
         ptr: &impl PtrSize,
     ) {
-        masm.load(vm_runtime_limits_addr, alloc_scratch, OperandSize::S64);
+        masm.load_ptr(vm_runtime_limits_addr, alloc_scratch);
         let last_wasm_exit_fp_addr = masm.address_at_reg(
             alloc_scratch,
             ptr.vmruntime_limits_last_wasm_exit_fp().into(),
@@ -685,19 +681,20 @@ where
         // Handle the frame pointer.
         let fp = <M::ABI as ABI>::fp_reg();
         let fp_addr = masm.address_at_reg(fp, 0);
-        masm.load(fp_addr, scratch, OperandSize::S64);
+        masm.load_ptr(fp_addr, scratch);
         masm.store(scratch.into(), last_wasm_exit_fp_addr, OperandSize::S64);
 
         // Handle the return address.
         let ret_addr_offset = <M::ABI as ABI>::ret_addr_offset();
         let ret_addr = masm.address_at_reg(fp, ret_addr_offset.into());
-        masm.load(ret_addr, scratch, OperandSize::S64);
+        masm.load_ptr(ret_addr, scratch);
         masm.store(scratch.into(), last_wasm_exit_pc_addr, OperandSize::S64);
     }
 
     /// The trampoline's prologue.
     fn prologue(&mut self) {
         self.masm.prologue();
+        self.masm.save_clobbers(&[]);
     }
 
     /// Similar to [Trampoline::prologue], but saves
@@ -705,11 +702,7 @@ where
     fn prologue_with_callee_saved(&mut self) {
         self.masm.prologue();
         // Save any callee-saved registers.
-        let mut off = 0;
-        for (r, s) in &self.callee_saved_regs {
-            let slot = self.masm.save(off, *r, *s);
-            off += slot.size;
-        }
+        self.masm.save_clobbers(&self.callee_saved_regs);
     }
 
     /// Similar to [Trampoline::epilogue], but restores
@@ -718,9 +711,7 @@ where
         // Free the stack space allocated by pushing the trampoline arguments.
         self.masm.free_stack(arg_size);
         // Restore the callee-saved registers.
-        for (r, s) in self.callee_saved_regs.iter().rev() {
-            self.masm.pop(*r, *s);
-        }
+        self.masm.restore_clobbers(&self.callee_saved_regs);
         self.masm.epilogue(0);
     }
 
@@ -728,6 +719,7 @@ where
     fn epilogue(&mut self, arg_size: u32) {
         // Free the stack space allocated by pushing the trampoline arguments.
         self.masm.free_stack(arg_size);
+        self.masm.restore_clobbers(&[]);
         self.masm.epilogue(0);
     }
 }
