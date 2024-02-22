@@ -11,7 +11,7 @@ use wasmtime::{
     component::{Component, Linker, Resource, ResourceTable},
     Config, Engine, Store,
 };
-use wasmtime_wasi::preview2::{self, pipe::MemoryOutputPipe, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{self, pipe::MemoryOutputPipe, WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::{
     bindings::http::types::ErrorCode,
     body::HyperIncomingBody,
@@ -160,7 +160,7 @@ async fn run_wasi_http(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let out = store.data_mut().new_response_outparam(sender)?;
 
-    let handle = preview2::spawn(async move {
+    let handle = wasmtime_wasi::spawn(async move {
         proxy
             .wasi_http_incoming_handler()
             .call_handle(&mut store, req, out)
@@ -174,20 +174,20 @@ async fn run_wasi_http(
             use http_body_util::BodyExt;
             let (parts, body) = resp.into_parts();
             let collected = BodyExt::collect(body).await?;
-            Ok(hyper::Response::from_parts(parts, collected))
+            Some(Ok(hyper::Response::from_parts(parts, collected)))
         }
+        Ok(Err(e)) => Some(Err(e)),
 
-        Ok(Err(e)) => Err(e),
-
-        // This happens if the wasm never calls `set-response-outparam`
-        Err(e) => panic!("Failed to receive a response: {e:?}"),
+        // Fall through below to the `resp.expect(...)` which will hopefully
+        // return a more specific error from `handle.await`.
+        Err(_) => None,
     };
 
-    // Now that the response has been processed, we can wait on the wasm to finish without
-    // deadlocking.
+    // Now that the response has been processed, we can wait on the wasm to
+    // finish without deadlocking.
     handle.await.context("Component execution")?;
 
-    Ok(resp)
+    Ok(resp.expect("wasm never called set-response-outparam"))
 }
 
 #[test_log::test(tokio::test)]
@@ -267,7 +267,7 @@ async fn do_wasi_http_hash_all(override_send_request: bool) -> Result<()> {
                 let response = handle(request.into_parts().0).map(|resp| {
                     Ok(IncomingResponseInternal {
                         resp,
-                        worker: Arc::new(preview2::spawn(future::ready(()))),
+                        worker: Arc::new(wasmtime_wasi::spawn(future::ready(()))),
                         between_bytes_timeout,
                     })
                 });

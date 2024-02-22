@@ -3,7 +3,7 @@ use crate::abi::{align_to, ABIOperand, ABIParams, ABIResults, ABISig, ParamsOrRe
 use crate::isa::{reg::Reg, CallingConvention};
 use crate::masm::OperandSize;
 use smallvec::SmallVec;
-use wasmtime_environ::{WasmFuncType, WasmHeapType, WasmType};
+use wasmtime_environ::{WasmFuncType, WasmHeapType, WasmValType};
 
 #[derive(Default)]
 pub(crate) struct Aarch64ABI;
@@ -79,7 +79,7 @@ impl ABI for Aarch64ABI {
         8
     }
 
-    fn word_bits() -> u32 {
+    fn word_bits() -> u8 {
         64
     }
 
@@ -88,8 +88,8 @@ impl ABI for Aarch64ABI {
     }
 
     fn sig_from(
-        params: &[WasmType],
-        returns: &[WasmType],
+        params: &[WasmValType],
+        returns: &[WasmValType],
         call_conv: &CallingConvention,
     ) -> ABISig {
         assert!(call_conv.is_apple_aarch64() || call_conv.is_default());
@@ -109,7 +109,7 @@ impl ABI for Aarch64ABI {
         ABISig::new(params, results)
     }
 
-    fn abi_results(returns: &[WasmType], call_conv: &CallingConvention) -> ABIResults {
+    fn abi_results(returns: &[WasmValType], call_conv: &CallingConvention) -> ABIResults {
         assert!(call_conv.is_apple_aarch64() || call_conv.is_default());
 
         let mut returns_index_env = RegIndexEnv::with_limit(1);
@@ -147,54 +147,62 @@ impl ABI for Aarch64ABI {
         regs::callee_saved()
     }
 
-    fn stack_slot_size() -> u32 {
+    fn stack_slot_size() -> u8 {
         Self::word_bytes()
     }
 
-    fn sizeof(ty: &WasmType) -> u32 {
+    fn sizeof(ty: &WasmValType) -> u8 {
         match ty {
-            WasmType::Ref(rt) => match rt.heap_type {
+            WasmValType::Ref(rt) => match rt.heap_type {
                 WasmHeapType::Func => Self::word_bytes(),
                 ht => unimplemented!("Support for WasmHeapType: {ht}"),
             },
-            WasmType::F64 | WasmType::I64 => Self::word_bytes(),
-            WasmType::F32 | WasmType::I32 => Self::word_bytes() / 2,
+            WasmValType::F64 | WasmValType::I64 => Self::word_bytes(),
+            WasmValType::F32 | WasmValType::I32 => Self::word_bytes() / 2,
             ty => unimplemented!("Support for WasmType: {ty}"),
         }
+    }
+
+    fn sizeof_bits(ty: &WasmValType) -> u8 {
+        Self::sizeof(ty) * 8
     }
 }
 
 impl Aarch64ABI {
     fn to_abi_operand(
-        wasm_arg: &WasmType,
+        wasm_arg: &WasmValType,
         stack_offset: u32,
         index_env: &mut RegIndexEnv,
         params_or_returns: ParamsOrReturns,
     ) -> (ABIOperand, u32) {
         let (reg, ty) = match wasm_arg {
-            ty @ (WasmType::I32 | WasmType::I64) => (index_env.next_xreg().map(regs::xreg), ty),
+            ty @ (WasmValType::I32 | WasmValType::I64) => {
+                (index_env.next_xreg().map(regs::xreg), ty)
+            }
 
-            ty @ (WasmType::F32 | WasmType::F64) => (index_env.next_vreg().map(regs::vreg), ty),
+            ty @ (WasmValType::F32 | WasmValType::F64) => {
+                (index_env.next_vreg().map(regs::vreg), ty)
+            }
 
             ty => unreachable!("Unsupported argument type {:?}", ty),
         };
 
         let ty_size = <Self as ABI>::sizeof(wasm_arg);
         let default = || {
-            let arg = ABIOperand::stack_offset(stack_offset, *ty, ty_size);
+            let arg = ABIOperand::stack_offset(stack_offset, *ty, ty_size as u32);
             let slot_size = Self::stack_slot_size();
             // Stack slots for parameters are aligned to a fixed slot size,
             // in the case of Aarch64, 8 bytes.
             // Stack slots for returns are type-size aligned.
             let next_stack = if params_or_returns == ParamsOrReturns::Params {
-                align_to(stack_offset, slot_size) + slot_size
+                align_to(stack_offset, slot_size as u32) + (slot_size as u32)
             } else {
-                align_to(stack_offset, ty_size) + ty_size
+                align_to(stack_offset, ty_size as u32) + (ty_size as u32)
             };
             (arg, next_stack)
         };
         reg.map_or_else(default, |reg| {
-            (ABIOperand::reg(reg, *ty, ty_size), stack_offset)
+            (ABIOperand::reg(reg, *ty, ty_size as u32), stack_offset)
         })
     }
 }
@@ -210,7 +218,7 @@ mod tests {
     };
     use wasmtime_environ::{
         WasmFuncType,
-        WasmType::{self, *},
+        WasmValType::{self, *},
     };
 
     #[test]
@@ -287,7 +295,7 @@ mod tests {
         match_reg_arg(params.get(8).unwrap(), F64, regs::vreg(5));
     }
 
-    fn match_reg_arg(abi_arg: &ABIOperand, expected_ty: WasmType, expected_reg: Reg) {
+    fn match_reg_arg(abi_arg: &ABIOperand, expected_ty: WasmValType, expected_reg: Reg) {
         match abi_arg {
             &ABIOperand::Reg { reg, ty, .. } => {
                 assert_eq!(reg, expected_reg);
@@ -297,7 +305,7 @@ mod tests {
         }
     }
 
-    fn match_stack_arg(abi_arg: &ABIOperand, expected_ty: WasmType, expected_offset: u32) {
+    fn match_stack_arg(abi_arg: &ABIOperand, expected_ty: WasmValType, expected_offset: u32) {
         match abi_arg {
             &ABIOperand::Stack { offset, ty, .. } => {
                 assert_eq!(offset, expected_offset);

@@ -1,19 +1,23 @@
 //!
-//! # Default ABI
+//! The Default ABI
 //!
-//! Winch uses a default internal ABI, for all internal functions.
-//! This allows us to push the complexity of system ABI compliance to
-//! the trampolines (not yet implemented).  The default ABI treats all
-//! allocatable registers as caller saved, which means that (i) all
-//! register values in the Wasm value stack (which are normally
-//! referred to as "live"), must be saved onto the machine stack (ii)
-//! function prologues and epilogues don't store/restore other
-//! registers more than the non-allocatable ones (e.g. rsp/rbp in
-//! x86_64).
+//! Winch uses a default ABI, for all internal functions. This allows
+//! us to push the complexity of system ABI compliance to the trampolines.  The
+//! default ABI treats all allocatable registers as caller saved, which means
+//! that (i) all register values in the Wasm value stack (which are normally
+//! referred to as "live"), must be saved onto the machine stack (ii) function
+//! prologues and epilogues don't store/restore other registers more than the
+//! non-allocatable ones (e.g. rsp/rbp in x86_64).
 //!
-//! The calling convention in the default ABI, uses registers to a
-//! certain fixed count for arguments and return values, and then the
-//! stack is used for all additional arguments.
+//! The calling convention in the default ABI, uses registers to a certain fixed
+//! count for arguments and return values, and then the stack is used for all
+//! additional arguments and return values. Aside from the parameters declared
+//! in each WebAssembly function, Winch's ABI declares two extra parameters, to
+//! hold the callee and caller `VMContext` pointers. A well-known `LocalSlot` is
+//! reserved for the callee VMContext pointer and also a particular pinned
+//! register is used to hold the value of the callee `VMContext`, which is
+//! available throughout the lifetime of the function.
+//!
 //!
 //! Generally the stack layout looks like:
 //! +-------------------------------+
@@ -28,10 +32,10 @@
 //! |            SP                 |
 //! +-------------------------------+----> SP @ Function prologue
 //! |                               |
+//! +-------------------------------+----> VMContext slot
 //! |                               |
 //! |                               |
 //! |        Stack slots            |
-//! |        + `VMContext` slot     |
 //! |        + dynamic space        |
 //! |                               |
 //! |                               |
@@ -47,7 +51,7 @@ use crate::masm::{OperandSize, SPOffset};
 use smallvec::SmallVec;
 use std::collections::HashSet;
 use std::ops::{Add, BitAnd, Not, Sub};
-use wasmtime_environ::{WasmFuncType, WasmHeapType, WasmRefType, WasmType};
+use wasmtime_environ::{WasmFuncType, WasmHeapType, WasmRefType, WasmValType};
 
 pub(crate) mod local;
 pub(crate) use local::*;
@@ -58,6 +62,84 @@ pub(crate) use local::*;
 pub(super) enum ParamsOrReturns {
     Params,
     Returns,
+}
+
+/// Macro to get the pinned register holding the [VMContext].
+macro_rules! vmctx {
+    ($m:ident) => {
+        <$m::ABI as ABI>::vmctx_reg()
+    };
+}
+
+pub(crate) use vmctx;
+
+/// Constructs an [ABISig] using Winch's ABI.
+pub(crate) fn wasm_sig<A: ABI>(ty: &WasmFuncType) -> ABISig {
+    // 6 is used semi-arbitrarily here, we can modify as we see fit.
+    let mut params: SmallVec<[WasmValType; 6]> = SmallVec::new();
+    params.extend_from_slice(&vmctx_types::<A>());
+    params.extend_from_slice(ty.params());
+
+    A::sig_from(&params, ty.returns(), &CallingConvention::Default)
+}
+
+/// Returns the callee and caller [VMContext] types.
+pub(crate) fn vmctx_types<A: ABI>() -> [WasmValType; 2] {
+    [A::ptr_type(), A::ptr_type()]
+}
+
+/// Returns an [ABISig] for the array calling convention.
+/// The signature looks like:
+/// ```ignore
+/// unsafe extern "C" fn(
+///     callee_vmctx: *mut VMOpaqueContext,
+///     caller_vmctx: *mut VMOpaqueContext,
+///     values_ptr: *mut ValRaw,
+///     values_len: usize,
+/// )
+/// ```
+pub(crate) fn array_sig<A: ABI>(call_conv: &CallingConvention) -> ABISig {
+    let params = [A::ptr_type(), A::ptr_type(), A::ptr_type(), A::ptr_type()];
+    A::sig_from(&params, &[], call_conv)
+}
+
+/// Returns an [ABISig] that follows a variation of the system's
+/// calling convention.
+/// The main difference between the flavor of the returned signature
+/// and the vanilla signature is how multiple values are returned.
+/// Multiple returns are handled following Wasmtime's expectations:
+/// * A single value is returned via a register according to the calling
+///   convention.
+/// * More than one values are returned via a return pointer.
+/// These variations look like:
+///
+/// Single return value.
+///
+/// ```ignore
+/// unsafe extern "C" fn(
+///     callee_vmctx: *mut VMOpaqueContext,
+///     caller_vmctx: *mut VMOpaqueContext,
+///     // rest of parameters
+/// ) -> // single result
+/// ```
+///
+/// Multiple return values.
+///
+/// ```ignore
+/// unsafe extern "C" fn(
+///     callee_vmctx: *mut VMOpaqueContext,
+///     caller_vmctx: *mut VMOpaqueContext,
+///     // rest of parameters
+///     retptr: *mut (), // 2+ results
+/// ) -> // first result
+/// ```
+pub(crate) fn native_sig<A: ABI>(ty: &WasmFuncType, call_conv: &CallingConvention) -> ABISig {
+    // 6 is used semi-arbitrarily here, we can modify as we see fit.
+    let mut params: SmallVec<[WasmValType; 6]> = SmallVec::new();
+    params.extend_from_slice(&vmctx_types::<A>());
+    params.extend_from_slice(ty.params());
+
+    A::sig_from(&params, ty.returns(), call_conv)
 }
 
 /// Trait implemented by a specific ISA and used to provide
@@ -81,17 +163,20 @@ pub(crate) trait ABI {
     fn sig(wasm_sig: &WasmFuncType, call_conv: &CallingConvention) -> ABISig;
 
     /// Construct an ABI signature from WasmType params and returns.
-    fn sig_from(params: &[WasmType], returns: &[WasmType], call_conv: &CallingConvention)
-        -> ABISig;
+    fn sig_from(
+        params: &[WasmValType],
+        returns: &[WasmValType],
+        call_conv: &CallingConvention,
+    ) -> ABISig;
 
     /// Construct [`ABIResults`] from a slice of [`WasmType`].
-    fn abi_results(returns: &[WasmType], call_conv: &CallingConvention) -> ABIResults;
+    fn abi_results(returns: &[WasmValType], call_conv: &CallingConvention) -> ABIResults;
 
     /// Returns the number of bits in a word.
-    fn word_bits() -> u32;
+    fn word_bits() -> u8;
 
     /// Returns the number of bytes in a word.
-    fn word_bytes() -> u32 {
+    fn word_bytes() -> u8 {
         Self::word_bits() / 8
     }
 
@@ -102,15 +187,15 @@ pub(crate) trait ABI {
     fn float_scratch_reg() -> Reg;
 
     /// Returns the designated scratch register for the given [WasmType].
-    fn scratch_for(ty: &WasmType) -> Reg {
+    fn scratch_for(ty: &WasmValType) -> Reg {
         match ty {
-            WasmType::I32
-            | WasmType::I64
-            | WasmType::Ref(WasmRefType {
+            WasmValType::I32
+            | WasmValType::I64
+            | WasmValType::Ref(WasmRefType {
                 heap_type: WasmHeapType::Func,
                 ..
             }) => Self::scratch_reg(),
-            WasmType::F32 | WasmType::F64 => Self::float_scratch_reg(),
+            WasmValType::F32 | WasmValType::F64 => Self::float_scratch_reg(),
             _ => unimplemented!(),
         }
     }
@@ -130,10 +215,20 @@ pub(crate) trait ABI {
     fn callee_saved_regs(call_conv: &CallingConvention) -> SmallVec<[(Reg, OperandSize); 18]>;
 
     /// The size, in bytes, of each stack slot used for stack parameter passing.
-    fn stack_slot_size() -> u32;
+    fn stack_slot_size() -> u8;
 
     /// Returns the size in bytes of the given [`WasmType`].
-    fn sizeof(ty: &WasmType) -> u32;
+    fn sizeof(ty: &WasmValType) -> u8;
+
+    /// Returns the size in bits of the given [`WasmType`].
+    fn sizeof_bits(ty: &WasmValType) -> u8;
+
+    /// The target pointer size represented as [WasmValType].
+    fn ptr_type() -> WasmValType {
+        // Defaulting to 64, since we currently only support 64-bit
+        // architectures.
+        WasmValType::I64
+    }
 }
 
 /// ABI-specific representation of function argument or result.
@@ -142,7 +237,7 @@ pub enum ABIOperand {
     /// A register [`ABIOperand`].
     Reg {
         /// The type of the [`ABIOperand`].
-        ty: WasmType,
+        ty: WasmValType,
         /// Register holding the [`ABIOperand`].
         reg: Reg,
         /// The size of the [`ABIOperand`], in bytes.
@@ -151,7 +246,7 @@ pub enum ABIOperand {
     /// A stack [`ABIOperand`].
     Stack {
         /// The type of the [`ABIOperand`].
-        ty: WasmType,
+        ty: WasmValType,
         /// Offset of the operand referenced through FP by the callee and
         /// through SP by the caller.
         offset: u32,
@@ -162,12 +257,12 @@ pub enum ABIOperand {
 
 impl ABIOperand {
     /// Allocate a new register [`ABIOperand`].
-    pub fn reg(reg: Reg, ty: WasmType, size: u32) -> Self {
+    pub fn reg(reg: Reg, ty: WasmValType, size: u32) -> Self {
         Self::Reg { reg, ty, size }
     }
 
     /// Allocate a new stack [`ABIOperand`].
-    pub fn stack_offset(offset: u32, ty: WasmType, size: u32) -> Self {
+    pub fn stack_offset(offset: u32, ty: WasmValType, size: u32) -> Self {
         Self::Stack { ty, offset, size }
     }
 
@@ -199,7 +294,7 @@ impl ABIOperand {
     }
 
     /// Get the type associated to this [`ABIOperand`].
-    pub fn ty(&self) -> WasmType {
+    pub fn ty(&self) -> WasmValType {
         match *self {
             ABIOperand::Reg { ty, .. } | ABIOperand::Stack { ty, .. } => ty,
         }
@@ -303,13 +398,13 @@ impl ABIResults {
     /// Creates [`ABIResults`] from a slice of `WasmType`.
     /// This function maps the given return types to their ABI specific
     /// representation. It does so, by iterating over them and applying the
-    /// given `map` closure. The map closure takes a [WasmType], maps its ABI
+    /// given `map` closure. The map closure takes a [WasmValType], maps its ABI
     /// representation, according to the calling convention. In the case of
     /// results, one result is stored in registers and the rest at particular
     /// offsets in the stack.
-    pub fn from<F>(returns: &[WasmType], call_conv: &CallingConvention, mut map: F) -> Self
+    pub fn from<F>(returns: &[WasmValType], call_conv: &CallingConvention, mut map: F) -> Self
     where
-        F: FnMut(&WasmType, u32) -> (ABIOperand, u32),
+        F: FnMut(&WasmValType, u32) -> (ABIOperand, u32),
     {
         if returns.len() == 0 {
             return Self::default();
@@ -452,13 +547,13 @@ impl ABIParams {
     /// params, multiple params may be passed in registers and the rest on the
     /// stack depending on the calling convention.
     pub fn from<F, A: ABI>(
-        params: &[WasmType],
+        params: &[WasmValType],
         initial_bytes: u32,
         needs_stack_results: bool,
         mut map: F,
     ) -> Self
     where
-        F: FnMut(&WasmType, u32) -> (ABIOperand, u32),
+        F: FnMut(&WasmValType, u32) -> (ABIOperand, u32),
     {
         if params.len() == 0 && !needs_stack_results {
             return Self::with_bytes(initial_bytes);
@@ -485,7 +580,7 @@ impl ABIParams {
             },
         );
 
-        let ptr_type = ptr_type_from_ptr_size(<A as ABI>::word_bytes() as u8);
+        let ptr_type = ptr_type_from_ptr_size(<A as ABI>::word_bytes());
         // Handle stack results by specifying an extra, implicit last argument.
         if needs_stack_results {
             let (operand, bytes) = map(&ptr_type, stack_bytes);

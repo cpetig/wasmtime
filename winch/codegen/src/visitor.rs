@@ -4,21 +4,20 @@
 //! which validates and dispatches to the corresponding
 //! machine code emitter.
 
-use crate::abi::{RetArea, ABI};
+use crate::abi::RetArea;
 use crate::codegen::{control_index, Callee, CodeGen, ControlStackFrame, FnCall};
 use crate::masm::{
     DivKind, ExtendKind, FloatCmpKind, IntCmpKind, MacroAssembler, MemMoveDirection, OperandSize,
-    RegImm, RemKind, RoundingMode, SPOffset, ShiftKind,
+    RegImm, RemKind, RoundingMode, SPOffset, ShiftKind, TruncKind,
 };
 use crate::stack::{TypedReg, Val};
 use cranelift_codegen::ir::TrapCode;
 use regalloc2::RegClass;
 use smallvec::SmallVec;
-use wasmparser::BrTable;
-use wasmparser::{BlockType, Ieee32, Ieee64, VisitOperator};
+use wasmparser::{BlockType, BrTable, Ieee32, Ieee64, MemArg, VisitOperator};
 use wasmtime_environ::{
-    FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TableStyle, TypeIndex, WasmHeapType, WasmType,
-    FUNCREF_INIT_BIT,
+    FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TableStyle, TypeIndex, WasmHeapType,
+    WasmValType, FUNCREF_INIT_BIT,
 };
 
 /// A macro to define unsupported WebAssembly operators.
@@ -208,6 +207,39 @@ macro_rules! def_unsupported {
     (emit MemoryFill $($rest:tt)*) => {};
     (emit MemorySize $($rest:tt)*) => {};
     (emit MemoryGrow $($rest:tt)*) => {};
+    (emit I32Load $($rest:tt)*) => {};
+    (emit I32Load8S $($rest:tt)*) => {};
+    (emit I32Load8U $($rest:tt)*) => {};
+    (emit I32Load16S $($rest:tt)*) => {};
+    (emit I32Load16U $($rest:tt)*) => {};
+    (emit I64Load8S $($rest:tt)*) => {};
+    (emit I64Load8U $($rest:tt)*) => {};
+    (emit I64Load16S $($rest:tt)*) => {};
+    (emit I64Load16U $($rest:tt)*) => {};
+    (emit I64Load32S $($rest:tt)*) => {};
+    (emit I64Load32U $($rest:tt)*) => {};
+    (emit I64Load $($rest:tt)*) => {};
+    (emit I32Store $($rest:tt)*) => {};
+    (emit I32Store $($rest:tt)*) => {};
+    (emit I32Store8 $($rest:tt)*) => {};
+    (emit I32Store16 $($rest:tt)*) => {};
+    (emit I64Store $($rest:tt)*) => {};
+    (emit I64Store8 $($rest:tt)*) => {};
+    (emit I64Store16 $($rest:tt)*) => {};
+    (emit I64Store32 $($rest:tt)*) => {};
+    (emit F32Load $($rest:tt)*) => {};
+    (emit F32Store $($rest:tt)*) => {};
+    (emit F64Load $($rest:tt)*) => {};
+    (emit F64Store $($rest:tt)*) => {};
+    (emit I32TruncSatF32S $($rest:tt)*) => {};
+    (emit I32TruncSatF32U $($rest:tt)*) => {};
+    (emit I32TruncSatF64S $($rest:tt)*) => {};
+    (emit I32TruncSatF64U $($rest:tt)*) => {};
+    (emit I64TruncSatF32S $($rest:tt)*) => {};
+    (emit I64TruncSatF32U $($rest:tt)*) => {};
+    (emit I64TruncSatF64S $($rest:tt)*) => {};
+    (emit I64TruncSatF64U $($rest:tt)*) => {};
+
 
     (emit $unsupported:tt $($rest:tt)*) => {$($rest)*};
 }
@@ -421,43 +453,107 @@ where
     }
 
     fn visit_f32_floor(&mut self) {
-        self.masm
-            .float_round(RoundingMode::Down, &mut self.context, OperandSize::S32);
+        self.masm.float_round(
+            RoundingMode::Down,
+            &mut self.env,
+            &mut self.context,
+            OperandSize::S32,
+            |env, cx, masm| {
+                let builtin = env.builtins.floor_f32::<M::ABI>();
+                FnCall::emit::<M, M::Ptr>(masm, cx, Callee::Builtin(builtin));
+            },
+        );
     }
 
     fn visit_f64_floor(&mut self) {
-        self.masm
-            .float_round(RoundingMode::Down, &mut self.context, OperandSize::S64);
+        self.masm.float_round(
+            RoundingMode::Down,
+            &mut self.env,
+            &mut self.context,
+            OperandSize::S64,
+            |env, cx, masm| {
+                let builtin = env.builtins.floor_f64::<M::ABI>();
+                FnCall::emit::<M, M::Ptr>(masm, cx, Callee::Builtin(builtin));
+            },
+        );
     }
 
     fn visit_f32_ceil(&mut self) {
-        self.masm
-            .float_round(RoundingMode::Up, &mut self.context, OperandSize::S32);
+        self.masm.float_round(
+            RoundingMode::Up,
+            &mut self.env,
+            &mut self.context,
+            OperandSize::S32,
+            |env, cx, masm| {
+                let builtin = env.builtins.ceil_f32::<M::ABI>();
+                FnCall::emit::<M, M::Ptr>(masm, cx, Callee::Builtin(builtin));
+            },
+        );
     }
 
     fn visit_f64_ceil(&mut self) {
-        self.masm
-            .float_round(RoundingMode::Up, &mut self.context, OperandSize::S64);
+        self.masm.float_round(
+            RoundingMode::Up,
+            &mut self.env,
+            &mut self.context,
+            OperandSize::S64,
+            |env, cx, masm| {
+                let builtin = env.builtins.ceil_f64::<M::ABI>();
+                FnCall::emit::<M, M::Ptr>(masm, cx, Callee::Builtin(builtin));
+            },
+        );
     }
 
     fn visit_f32_nearest(&mut self) {
-        self.masm
-            .float_round(RoundingMode::Nearest, &mut self.context, OperandSize::S32);
+        self.masm.float_round(
+            RoundingMode::Nearest,
+            &mut self.env,
+            &mut self.context,
+            OperandSize::S32,
+            |env, cx, masm| {
+                let builtin = env.builtins.nearest_f32::<M::ABI>();
+                FnCall::emit::<M, M::Ptr>(masm, cx, Callee::Builtin(builtin))
+            },
+        );
     }
 
     fn visit_f64_nearest(&mut self) {
-        self.masm
-            .float_round(RoundingMode::Nearest, &mut self.context, OperandSize::S64);
+        self.masm.float_round(
+            RoundingMode::Nearest,
+            &mut self.env,
+            &mut self.context,
+            OperandSize::S64,
+            |env, cx, masm| {
+                let builtin = env.builtins.nearest_f64::<M::ABI>();
+                FnCall::emit::<M, M::Ptr>(masm, cx, Callee::Builtin(builtin));
+            },
+        );
     }
 
     fn visit_f32_trunc(&mut self) {
-        self.masm
-            .float_round(RoundingMode::Zero, &mut self.context, OperandSize::S32);
+        self.masm.float_round(
+            RoundingMode::Zero,
+            &mut self.env,
+            &mut self.context,
+            OperandSize::S32,
+            |env, cx, masm| {
+                let builtin = env.builtins.trunc_f32::<M::ABI>();
+                FnCall::emit::<M, M::Ptr>(masm, cx, Callee::Builtin(builtin));
+            },
+        );
     }
 
     fn visit_f64_trunc(&mut self) {
-        self.masm
-            .float_round(RoundingMode::Zero, &mut self.context, OperandSize::S64);
+        self.masm.float_round(
+            RoundingMode::Zero,
+            &mut self.env,
+            &mut self.context,
+            OperandSize::S64,
+            |env, cx, masm| {
+                let builtin = env.builtins.trunc_f64::<M::ABI>();
+                FnCall::emit::<M, M::Ptr>(masm, cx, Callee::Builtin(builtin));
+            },
+        );
     }
 
     fn visit_f32_sqrt(&mut self) {
@@ -598,7 +694,7 @@ where
 
     fn visit_f32_convert_i32_s(&mut self) {
         self.context
-            .convert_op(self.masm, WasmType::F32, |masm, dst, src, dst_size| {
+            .convert_op(self.masm, WasmValType::F32, |masm, dst, src, dst_size| {
                 masm.signed_convert(src, dst, OperandSize::S32, dst_size);
             });
     }
@@ -606,7 +702,7 @@ where
     fn visit_f32_convert_i32_u(&mut self) {
         self.context.convert_op_with_tmp_reg(
             self.masm,
-            WasmType::F32,
+            WasmValType::F32,
             RegClass::Int,
             |masm, dst, src, tmp_gpr, dst_size| {
                 masm.unsigned_convert(src, dst, tmp_gpr, OperandSize::S32, dst_size);
@@ -616,7 +712,7 @@ where
 
     fn visit_f32_convert_i64_s(&mut self) {
         self.context
-            .convert_op(self.masm, WasmType::F32, |masm, dst, src, dst_size| {
+            .convert_op(self.masm, WasmValType::F32, |masm, dst, src, dst_size| {
                 masm.signed_convert(src, dst, OperandSize::S64, dst_size);
             });
     }
@@ -624,7 +720,7 @@ where
     fn visit_f32_convert_i64_u(&mut self) {
         self.context.convert_op_with_tmp_reg(
             self.masm,
-            WasmType::F32,
+            WasmValType::F32,
             RegClass::Int,
             |masm, dst, src, tmp_gpr, dst_size| {
                 masm.unsigned_convert(src, dst, tmp_gpr, OperandSize::S64, dst_size);
@@ -634,7 +730,7 @@ where
 
     fn visit_f64_convert_i32_s(&mut self) {
         self.context
-            .convert_op(self.masm, WasmType::F64, |masm, dst, src, dst_size| {
+            .convert_op(self.masm, WasmValType::F64, |masm, dst, src, dst_size| {
                 masm.signed_convert(src, dst, OperandSize::S32, dst_size);
             });
     }
@@ -642,7 +738,7 @@ where
     fn visit_f64_convert_i32_u(&mut self) {
         self.context.convert_op_with_tmp_reg(
             self.masm,
-            WasmType::F64,
+            WasmValType::F64,
             RegClass::Int,
             |masm, dst, src, tmp_gpr, dst_size| {
                 masm.unsigned_convert(src, dst, tmp_gpr, OperandSize::S32, dst_size);
@@ -652,7 +748,7 @@ where
 
     fn visit_f64_convert_i64_s(&mut self) {
         self.context
-            .convert_op(self.masm, WasmType::F64, |masm, dst, src, dst_size| {
+            .convert_op(self.masm, WasmValType::F64, |masm, dst, src, dst_size| {
                 masm.signed_convert(src, dst, OperandSize::S64, dst_size);
             });
     }
@@ -660,7 +756,7 @@ where
     fn visit_f64_convert_i64_u(&mut self) {
         self.context.convert_op_with_tmp_reg(
             self.masm,
-            WasmType::F64,
+            WasmValType::F64,
             RegClass::Int,
             |masm, dst, src, tmp_gpr, dst_size| {
                 masm.unsigned_convert(src, dst, tmp_gpr, OperandSize::S64, dst_size);
@@ -670,14 +766,14 @@ where
 
     fn visit_f32_reinterpret_i32(&mut self) {
         self.context
-            .convert_op(self.masm, WasmType::F32, |masm, dst, src, size| {
+            .convert_op(self.masm, WasmValType::F32, |masm, dst, src, size| {
                 masm.reinterpret_int_as_float(src.into(), dst, size);
             });
     }
 
     fn visit_f64_reinterpret_i64(&mut self) {
         self.context
-            .convert_op(self.masm, WasmType::F64, |masm, dst, src, size| {
+            .convert_op(self.masm, WasmValType::F64, |masm, dst, src, size| {
                 masm.reinterpret_int_as_float(src.into(), dst, size);
             });
     }
@@ -1138,8 +1234,8 @@ where
         use OperandSize::*;
 
         self.context
-            .convert_op(self.masm, WasmType::I32, |masm, dst, src, dst_size| {
-                masm.signed_truncate(src, dst, S32, dst_size);
+            .convert_op(self.masm, WasmValType::I32, |masm, dst, src, dst_size| {
+                masm.signed_truncate(src, dst, S32, dst_size, TruncKind::Unchecked);
             });
     }
 
@@ -1148,10 +1244,10 @@ where
 
         self.context.convert_op_with_tmp_reg(
             self.masm,
-            WasmType::I32,
+            WasmValType::I32,
             RegClass::Float,
             |masm, dst, src, tmp_fpr, dst_size| {
-                masm.unsigned_truncate(src, dst, tmp_fpr, S32, dst_size);
+                masm.unsigned_truncate(src, dst, tmp_fpr, S32, dst_size, TruncKind::Unchecked);
             },
         );
     }
@@ -1160,8 +1256,8 @@ where
         use OperandSize::*;
 
         self.context
-            .convert_op(self.masm, WasmType::I32, |masm, dst, src, dst_size| {
-                masm.signed_truncate(src, dst, S64, dst_size);
+            .convert_op(self.masm, WasmValType::I32, |masm, dst, src, dst_size| {
+                masm.signed_truncate(src, dst, S64, dst_size, TruncKind::Unchecked);
             });
     }
 
@@ -1170,10 +1266,10 @@ where
 
         self.context.convert_op_with_tmp_reg(
             self.masm,
-            WasmType::I32,
+            WasmValType::I32,
             RegClass::Float,
             |masm, dst, src, tmp_fpr, dst_size| {
-                masm.unsigned_truncate(src, dst, tmp_fpr, S64, dst_size);
+                masm.unsigned_truncate(src, dst, tmp_fpr, S64, dst_size, TruncKind::Unchecked);
             },
         );
     }
@@ -1182,8 +1278,8 @@ where
         use OperandSize::*;
 
         self.context
-            .convert_op(self.masm, WasmType::I64, |masm, dst, src, dst_size| {
-                masm.signed_truncate(src, dst, S32, dst_size);
+            .convert_op(self.masm, WasmValType::I64, |masm, dst, src, dst_size| {
+                masm.signed_truncate(src, dst, S32, dst_size, TruncKind::Unchecked);
             });
     }
 
@@ -1192,10 +1288,10 @@ where
 
         self.context.convert_op_with_tmp_reg(
             self.masm,
-            WasmType::I64,
+            WasmValType::I64,
             RegClass::Float,
             |masm, dst, src, tmp_fpr, dst_size| {
-                masm.unsigned_truncate(src, dst, tmp_fpr, S32, dst_size);
+                masm.unsigned_truncate(src, dst, tmp_fpr, S32, dst_size, TruncKind::Unchecked);
             },
         );
     }
@@ -1204,8 +1300,8 @@ where
         use OperandSize::*;
 
         self.context
-            .convert_op(self.masm, WasmType::I64, |masm, dst, src, dst_size| {
-                masm.signed_truncate(src, dst, S64, dst_size);
+            .convert_op(self.masm, WasmValType::I64, |masm, dst, src, dst_size| {
+                masm.signed_truncate(src, dst, S64, dst_size, TruncKind::Unchecked);
             });
     }
 
@@ -1214,35 +1310,32 @@ where
 
         self.context.convert_op_with_tmp_reg(
             self.masm,
-            WasmType::I64,
+            WasmValType::I64,
             RegClass::Float,
             |masm, dst, src, tmp_fpr, dst_size| {
-                masm.unsigned_truncate(src, dst, tmp_fpr, S64, dst_size);
+                masm.unsigned_truncate(src, dst, tmp_fpr, S64, dst_size, TruncKind::Unchecked);
             },
         );
     }
 
     fn visit_i32_reinterpret_f32(&mut self) {
         self.context
-            .convert_op(self.masm, WasmType::I32, |masm, dst, src, size| {
+            .convert_op(self.masm, WasmValType::I32, |masm, dst, src, size| {
                 masm.reinterpret_float_as_int(src.into(), dst, size);
             });
     }
 
     fn visit_i64_reinterpret_f64(&mut self) {
         self.context
-            .convert_op(self.masm, WasmType::I64, |masm, dst, src, size| {
+            .convert_op(self.masm, WasmValType::I64, |masm, dst, src, size| {
                 masm.reinterpret_float_as_int(src.into(), dst, size);
             });
     }
 
     fn visit_local_get(&mut self, index: u32) {
-        use WasmType::*;
+        use WasmValType::*;
         let context = &mut self.context;
-        let slot = context
-            .frame
-            .get_local(index)
-            .unwrap_or_else(|| panic!("valid local at slot = {}", index));
+        let slot = context.frame.get_wasm_local(index);
         match slot.ty {
             I32 | I64 | F32 | F64 => context.stack.push(Val::local(index, slot.ty)),
             Ref(rt) => match rt.heap_type {
@@ -1259,8 +1352,12 @@ where
     }
 
     fn visit_call(&mut self, index: u32) {
-        let callee = self.env.callee_from_index(FuncIndex::from_u32(index));
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |_| callee.clone());
+        FnCall::emit::<M, M::Ptr>(
+            self.masm,
+            &mut self.context,
+            self.env
+                .callee_from_index::<M::ABI>(FuncIndex::from_u32(index)),
+        )
     }
 
     fn visit_call_indirect(&mut self, type_index: u32, table_index: u32, _: u8) {
@@ -1289,48 +1386,38 @@ where
             }
         }
 
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |_| {
-            self.env.funcref(type_index)
-        })
+        FnCall::emit::<M, M::Ptr>(
+            self.masm,
+            &mut self.context,
+            self.env.funcref::<M::ABI>(type_index),
+        )
     }
 
     fn visit_table_init(&mut self, elem: u32, table: u32) {
-        let ptr_type = self.env.ptr_type();
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
-
         debug_assert!(self.context.stack.len() >= 3);
         let at = self.context.stack.len() - 3;
 
-        self.context.stack.insert_many(
-            at,
-            [
-                vmctx.into(),
-                table.try_into().unwrap(),
-                elem.try_into().unwrap(),
-            ],
-        );
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |cx| {
-            Callee::Builtin(cx.builtins.table_init::<M::ABI, M::Ptr>())
-        });
+        self.context
+            .stack
+            .insert_many(at, &[table.try_into().unwrap(), elem.try_into().unwrap()]);
+
+        let builtin = self.env.builtins.table_init::<M::ABI, M::Ptr>();
+        FnCall::emit::<M, M::Ptr>(
+            self.masm,
+            &mut self.context,
+            Callee::Builtin(builtin.clone()),
+        )
     }
 
     fn visit_table_copy(&mut self, dst: u32, src: u32) {
-        let ptr_type = self.env.ptr_type();
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
         debug_assert!(self.context.stack.len() >= 3);
         let at = self.context.stack.len() - 3;
-        self.context.stack.insert_many(
-            at,
-            [
-                vmctx.into(),
-                dst.try_into().unwrap(),
-                src.try_into().unwrap(),
-            ],
-        );
+        self.context
+            .stack
+            .insert_many(at, &[dst.try_into().unwrap(), src.try_into().unwrap()]);
 
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |context| {
-            Callee::Builtin(context.builtins.table_copy::<M::ABI, M::Ptr>())
-        });
+        let builtin = self.env.builtins.table_copy::<M::ABI, M::Ptr>();
+        FnCall::emit::<M, M::Ptr>(self.masm, &mut self.context, Callee::Builtin(builtin))
     }
 
     fn visit_table_get(&mut self, table: u32) {
@@ -1348,15 +1435,10 @@ where
     }
 
     fn visit_table_grow(&mut self, table: u32) {
-        let ptr_type = self.env.ptr_type();
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
         let table_index = TableIndex::from_u32(table);
         let table_plan = self.env.table_plan(table_index);
         let builtin = match table_plan.table.wasm_ty.heap_type {
-            WasmHeapType::Func => self
-                .context
-                .builtins
-                .table_grow_func_ref::<M::ABI, M::Ptr>(),
+            WasmHeapType::Func => self.env.builtins.table_grow_func_ref::<M::ABI, M::Ptr>(),
             ty => unimplemented!("Support for HeapType: {ty}"),
         };
 
@@ -1374,11 +1456,13 @@ where
         self.context.stack.inner_mut().swap(len - 1, len - 2);
         self.context
             .stack
-            .insert_many(at, [vmctx.into(), table.try_into().unwrap()]);
+            .insert_many(at, &[table.try_into().unwrap()]);
 
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |_| {
-            Callee::Builtin(builtin.clone())
-        });
+        FnCall::emit::<M, M::Ptr>(
+            self.masm,
+            &mut self.context,
+            Callee::Builtin(builtin.clone()),
+        )
     }
 
     fn visit_table_size(&mut self, table: u32) {
@@ -1388,15 +1472,10 @@ where
     }
 
     fn visit_table_fill(&mut self, table: u32) {
-        let ptr_type = self.env.ptr_type();
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
         let table_index = TableIndex::from_u32(table);
         let table_plan = self.env.table_plan(table_index);
         let builtin = match table_plan.table.wasm_ty.heap_type {
-            WasmHeapType::Func => self
-                .context
-                .builtins
-                .table_fill_func_ref::<M::ABI, M::Ptr>(),
+            WasmHeapType::Func => self.env.builtins.table_fill_func_ref::<M::ABI, M::Ptr>(),
             ty => unimplemented!("Support for heap type: {ty}"),
         };
 
@@ -1405,10 +1484,12 @@ where
         let at = len - 3;
         self.context
             .stack
-            .insert_many(at, [vmctx.into(), table.try_into().unwrap()]);
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |_| {
-            Callee::Builtin(builtin.clone())
-        })
+            .insert_many(at, &[table.try_into().unwrap()]);
+        FnCall::emit::<M, M::Ptr>(
+            self.masm,
+            &mut self.context,
+            Callee::Builtin(builtin.clone()),
+        )
     }
 
     fn visit_table_set(&mut self, table: u32) {
@@ -1449,33 +1530,20 @@ where
     }
 
     fn visit_elem_drop(&mut self, index: u32) {
-        let ptr_type = self.env.ptr_type();
-        let elem_drop = self.context.builtins.elem_drop::<M::ABI, M::Ptr>();
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
-        self.context
-            .stack
-            .extend([vmctx.into(), index.try_into().unwrap()]);
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |_| {
-            Callee::Builtin(elem_drop.clone())
-        });
+        let elem_drop = self.env.builtins.elem_drop::<M::ABI, M::Ptr>();
+        self.context.stack.extend([index.try_into().unwrap()]);
+        FnCall::emit::<M, M::Ptr>(self.masm, &mut self.context, Callee::Builtin(elem_drop))
     }
 
     fn visit_memory_init(&mut self, data_index: u32, mem: u32) {
         debug_assert!(self.context.stack.len() >= 3);
-        let ptr_type = self.env.ptr_type();
         let at = self.context.stack.len() - 3;
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
         self.context.stack.insert_many(
             at,
-            [
-                vmctx.into(),
-                mem.try_into().unwrap(),
-                data_index.try_into().unwrap(),
-            ],
+            &[mem.try_into().unwrap(), data_index.try_into().unwrap()],
         );
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |cx| {
-            Callee::Builtin(cx.builtins.memory_init::<M::ABI, M::Ptr>())
-        });
+        let builtin = self.env.builtins.memory_init::<M::ABI, M::Ptr>();
+        FnCall::emit::<M, M::Ptr>(self.masm, &mut self.context, Callee::Builtin(builtin))
     }
 
     fn visit_memory_copy(&mut self, dst_mem: u32, src_mem: u32) {
@@ -1485,37 +1553,32 @@ where
         //     [ vmctx, dst_mem, dst_offset, src_mem, src_offset, len ]
         // Which is the order expected by the builtin function.
         debug_assert!(self.context.stack.len() >= 3);
-        let ptr_type = self.env.ptr_type();
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
         let at = self.context.stack.len() - 2;
         self.context
             .stack
-            .insert_many(at, [src_mem.try_into().unwrap()]);
+            .insert_many(at, &[src_mem.try_into().unwrap()]);
 
         // One element was inserted above, so instead of 3, we use 4.
         let at = self.context.stack.len() - 4;
         self.context
             .stack
-            .insert_many(at, [vmctx.into(), dst_mem.try_into().unwrap()]);
+            .insert_many(at, &[dst_mem.try_into().unwrap()]);
 
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |cx| {
-            Callee::Builtin(cx.builtins.memory_copy::<M::ABI, M::Ptr>())
-        });
+        let builtin = self.env.builtins.memory_copy::<M::ABI, M::Ptr>();
+
+        FnCall::emit::<M, M::Ptr>(self.masm, &mut self.context, Callee::Builtin(builtin))
     }
 
     fn visit_memory_fill(&mut self, mem: u32) {
         debug_assert!(self.context.stack.len() >= 3);
-        let ptr_type = self.env.ptr_type();
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
         let at = self.context.stack.len() - 3;
 
         self.context
             .stack
-            .insert_many(at, [vmctx.into(), mem.try_into().unwrap()]);
+            .insert_many(at, &[mem.try_into().unwrap()]);
 
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |cx| {
-            Callee::Builtin(cx.builtins.memory_fill::<M::ABI, M::Ptr>())
-        });
+        let builtin = self.env.builtins.memory_fill::<M::ABI, M::Ptr>();
+        FnCall::emit::<M, M::Ptr>(self.masm, &mut self.context, Callee::Builtin(builtin))
     }
 
     fn visit_memory_size(&mut self, mem: u32, _: u8) {
@@ -1525,30 +1588,20 @@ where
 
     fn visit_memory_grow(&mut self, mem: u32, _: u8) {
         debug_assert!(self.context.stack.len() >= 1);
-        let ptr_type = self.env.ptr_type();
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
-        let at = self.context.stack.len() - 1;
         // The stack at this point contains: [ delta ]
         // The desired state is
         //   [ vmctx, delta, index ]
-        self.context.stack.insert_many(at, [vmctx.into()]);
         self.context.stack.extend([mem.try_into().unwrap()]);
 
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |cx| {
-            Callee::Builtin(cx.builtins.memory32_grow::<M::ABI, M::Ptr>())
-        });
+        let builtin = self.env.builtins.memory32_grow::<M::ABI, M::Ptr>();
+        FnCall::emit::<M, M::Ptr>(self.masm, &mut self.context, Callee::Builtin(builtin))
     }
 
     fn visit_data_drop(&mut self, data_index: u32) {
-        let ptr_type = self.env.ptr_type();
-        let vmctx = TypedReg::new(ptr_type, <M::ABI as ABI>::vmctx_reg());
-        self.context
-            .stack
-            .extend([vmctx.into(), data_index.try_into().unwrap()]);
+        self.context.stack.extend([data_index.try_into().unwrap()]);
 
-        FnCall::emit::<M, M::Ptr, _>(self.masm, &mut self.context, |cx| {
-            Callee::Builtin(cx.builtins.data_drop::<M::ABI, M::Ptr>())
-        });
+        let builtin = self.env.builtins.data_drop::<M::ABI, M::Ptr>();
+        FnCall::emit::<M, M::Ptr>(self.masm, &mut self.context, Callee::Builtin(builtin))
     }
 
     fn visit_nop(&mut self) {}
@@ -1761,10 +1814,7 @@ where
 
     fn visit_global_get(&mut self, global_index: u32) {
         let index = GlobalIndex::from_u32(global_index);
-        let (ty, offset) = self.env.resolve_global_type_and_offset(index);
-        let addr = self
-            .masm
-            .address_at_reg(<M::ABI as ABI>::vmctx_reg(), offset);
+        let (ty, addr) = self.emit_get_global_addr(index);
         let dst = self.context.reg_for_type(ty, self.masm);
         self.masm.load(addr, dst, ty.into());
         self.context.stack.push(Val::reg(dst, ty));
@@ -1772,10 +1822,8 @@ where
 
     fn visit_global_set(&mut self, global_index: u32) {
         let index = GlobalIndex::from_u32(global_index);
-        let (ty, offset) = self.env.resolve_global_type_and_offset(index);
-        let addr = self
-            .masm
-            .address_at_reg(<M::ABI as ABI>::vmctx_reg(), offset);
+        let (ty, addr) = self.emit_get_global_addr(index);
+
         let typed_reg = self.context.pop_to_reg(self.masm, None);
         self.context.free_reg(typed_reg.reg);
         self.masm.store(typed_reg.reg.into(), addr, ty.into());
@@ -1804,6 +1852,211 @@ where
         self.context.free_reg(cond);
     }
 
+    fn visit_i32_load(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(&memarg, WasmValType::I32, OperandSize::S32, None);
+    }
+
+    fn visit_i32_load8_s(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(
+            &memarg,
+            WasmValType::I32,
+            OperandSize::S8,
+            Some(ExtendKind::I32Extend8S),
+        );
+    }
+
+    fn visit_i32_load8_u(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(&memarg, WasmValType::I32, OperandSize::S8, None);
+    }
+
+    fn visit_i32_load16_s(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(
+            &memarg,
+            WasmValType::I32,
+            OperandSize::S16,
+            Some(ExtendKind::I32Extend16S),
+        )
+    }
+
+    fn visit_i32_load16_u(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(&memarg, WasmValType::I32, OperandSize::S16, None)
+    }
+
+    fn visit_i32_store(&mut self, memarg: MemArg) {
+        self.emit_wasm_store(&memarg, OperandSize::S32);
+    }
+
+    fn visit_i32_store8(&mut self, memarg: MemArg) {
+        self.emit_wasm_store(&memarg, OperandSize::S8)
+    }
+
+    fn visit_i32_store16(&mut self, memarg: MemArg) {
+        self.emit_wasm_store(&memarg, OperandSize::S16)
+    }
+
+    fn visit_i64_load8_s(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(
+            &memarg,
+            WasmValType::I64,
+            OperandSize::S8,
+            Some(ExtendKind::I64Extend8S),
+        )
+    }
+
+    fn visit_i64_load8_u(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(&memarg, WasmValType::I64, OperandSize::S8, None)
+    }
+
+    fn visit_i64_load16_u(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(&memarg, WasmValType::I64, OperandSize::S16, None)
+    }
+
+    fn visit_i64_load16_s(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(
+            &memarg,
+            WasmValType::I64,
+            OperandSize::S16,
+            Some(ExtendKind::I64Extend16S),
+        )
+    }
+
+    fn visit_i64_load32_u(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(&memarg, WasmValType::I64, OperandSize::S32, None)
+    }
+
+    fn visit_i64_load32_s(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(
+            &memarg,
+            WasmValType::I64,
+            OperandSize::S32,
+            Some(ExtendKind::I64Extend32S),
+        )
+    }
+
+    fn visit_i64_load(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(&memarg, WasmValType::I64, OperandSize::S64, None)
+    }
+
+    fn visit_i64_store(&mut self, memarg: MemArg) -> Self::Output {
+        self.emit_wasm_store(&memarg, OperandSize::S64)
+    }
+
+    fn visit_i64_store8(&mut self, memarg: MemArg) -> Self::Output {
+        self.emit_wasm_store(&memarg, OperandSize::S8)
+    }
+
+    fn visit_i64_store16(&mut self, memarg: MemArg) -> Self::Output {
+        self.emit_wasm_store(&memarg, OperandSize::S16)
+    }
+
+    fn visit_i64_store32(&mut self, memarg: MemArg) -> Self::Output {
+        self.emit_wasm_store(&memarg, OperandSize::S32)
+    }
+
+    fn visit_f32_load(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(&memarg, WasmValType::F32, OperandSize::S32, None)
+    }
+
+    fn visit_f32_store(&mut self, memarg: MemArg) {
+        self.emit_wasm_store(&memarg, OperandSize::S32)
+    }
+
+    fn visit_f64_load(&mut self, memarg: MemArg) {
+        self.emit_wasm_load(&memarg, WasmValType::F64, OperandSize::S64, None)
+    }
+
+    fn visit_f64_store(&mut self, memarg: MemArg) {
+        self.emit_wasm_store(&memarg, OperandSize::S64)
+    }
+
+    fn visit_i32_trunc_sat_f32_s(&mut self) {
+        use OperandSize::*;
+
+        self.context
+            .convert_op(self.masm, WasmValType::I32, |masm, dst, src, dst_size| {
+                masm.signed_truncate(src, dst, S32, dst_size, TruncKind::Checked);
+            });
+    }
+
+    fn visit_i32_trunc_sat_f32_u(&mut self) {
+        use OperandSize::*;
+
+        self.context.convert_op_with_tmp_reg(
+            self.masm,
+            WasmValType::I32,
+            RegClass::Float,
+            |masm, dst, src, tmp_fpr, dst_size| {
+                masm.unsigned_truncate(src, dst, tmp_fpr, S32, dst_size, TruncKind::Checked);
+            },
+        );
+    }
+
+    fn visit_i32_trunc_sat_f64_s(&mut self) {
+        use OperandSize::*;
+
+        self.context
+            .convert_op(self.masm, WasmValType::I32, |masm, dst, src, dst_size| {
+                masm.signed_truncate(src, dst, S64, dst_size, TruncKind::Checked);
+            });
+    }
+
+    fn visit_i32_trunc_sat_f64_u(&mut self) {
+        use OperandSize::*;
+
+        self.context.convert_op_with_tmp_reg(
+            self.masm,
+            WasmValType::I32,
+            RegClass::Float,
+            |masm, dst, src, tmp_fpr, dst_size| {
+                masm.unsigned_truncate(src, dst, tmp_fpr, S64, dst_size, TruncKind::Checked);
+            },
+        );
+    }
+
+    fn visit_i64_trunc_sat_f32_s(&mut self) {
+        use OperandSize::*;
+
+        self.context
+            .convert_op(self.masm, WasmValType::I64, |masm, dst, src, dst_size| {
+                masm.signed_truncate(src, dst, S32, dst_size, TruncKind::Checked);
+            });
+    }
+
+    fn visit_i64_trunc_sat_f32_u(&mut self) {
+        use OperandSize::*;
+
+        self.context.convert_op_with_tmp_reg(
+            self.masm,
+            WasmValType::I64,
+            RegClass::Float,
+            |masm, dst, src, tmp_fpr, dst_size| {
+                masm.unsigned_truncate(src, dst, tmp_fpr, S32, dst_size, TruncKind::Checked);
+            },
+        );
+    }
+
+    fn visit_i64_trunc_sat_f64_s(&mut self) {
+        use OperandSize::*;
+
+        self.context
+            .convert_op(self.masm, WasmValType::I64, |masm, dst, src, dst_size| {
+                masm.signed_truncate(src, dst, S64, dst_size, TruncKind::Checked);
+            });
+    }
+
+    fn visit_i64_trunc_sat_f64_u(&mut self) {
+        use OperandSize::*;
+
+        self.context.convert_op_with_tmp_reg(
+            self.masm,
+            WasmValType::I64,
+            RegClass::Float,
+            |masm, dst, src, tmp_fpr, dst_size| {
+                masm.unsigned_truncate(src, dst, tmp_fpr, S64, dst_size, TruncKind::Checked);
+            },
+        );
+    }
+
     wasmparser::for_each_operator!(def_unsupported);
 }
 
@@ -1827,12 +2080,12 @@ where
     }
 }
 
-impl From<WasmType> for OperandSize {
-    fn from(ty: WasmType) -> OperandSize {
+impl From<WasmValType> for OperandSize {
+    fn from(ty: WasmValType) -> OperandSize {
         match ty {
-            WasmType::I32 | WasmType::F32 => OperandSize::S32,
-            WasmType::I64 | WasmType::F64 => OperandSize::S64,
-            WasmType::Ref(rt) => {
+            WasmValType::I32 | WasmValType::F32 => OperandSize::S32,
+            WasmValType::I64 | WasmValType::F64 => OperandSize::S64,
+            WasmValType::Ref(rt) => {
                 match rt.heap_type {
                     // TODO: Harcoded size, assuming 64-bit support only. Once
                     // Wasmtime supports 32-bit architectures, this will need
@@ -1842,7 +2095,7 @@ impl From<WasmType> for OperandSize {
                     t => unimplemented!("Support for WasmHeapType: {t}"),
                 }
             }
-            ty => unimplemented!("Support for WasmType {ty}"),
+            ty => unimplemented!("Support for WasmValType {ty}"),
         }
     }
 }
