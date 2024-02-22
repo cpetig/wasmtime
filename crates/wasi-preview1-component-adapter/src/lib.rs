@@ -11,6 +11,7 @@
         unreachable_code
     )
 )]
+#![feature(thread_id_value)]
 
 use crate::bindings::wasi::clocks::{monotonic_clock, wall_clock};
 use crate::bindings::wasi::io::poll;
@@ -45,6 +46,10 @@ mod macros;
 
 mod descriptors;
 use crate::descriptors::{Descriptor, Descriptors, StreamType, Streams};
+
+fn get_thread_index() -> usize {
+    (std::thread::current().id().as_u64().get() as usize) % THREADS
+}
 
 pub mod bindings {
     #[cfg(feature = "command")]
@@ -184,7 +189,7 @@ pub unsafe extern "C" fn cabi_realloc(
     }
     let mut ptr = null_mut::<u8>();
     State::with(|state| {
-        ptr = state.import_alloc.alloc(align, new_size);
+        ptr = state.import_alloc[get_thread_index()].alloc(align, new_size);
         Ok(())
     });
     ptr
@@ -901,7 +906,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_pread(
             let ds = state.descriptors();
             let file = ds.get_file(fd)?;
             let (data, end) = state
-                .import_alloc
+                .import_alloc[get_thread_index()]
                 .with_buffer(ptr, len, || file.fd.read(len as u64, offset))?;
             assert_eq!(data.as_ptr(), ptr);
             assert!(data.len() <= len);
@@ -1055,7 +1060,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_read(
                 let read_len = u64::try_from(len).trapping_unwrap();
                 let wasi_stream = streams.get_read_stream()?;
                 let data = match state
-                    .import_alloc
+                    .import_alloc[get_thread_index()]
                     .with_buffer(ptr, len, || blocking_mode.read(wasi_stream, read_len))
                 {
                     Ok(data) => data,
@@ -1315,7 +1320,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_fd_readdir(
                     Ok((dirent, buffer))
                 });
             }
-            let entry = self.state.import_alloc.with_buffer(
+            let entry = self.state.import_alloc[get_thread_index()].with_buffer(
                 self.state.path_buf.get().cast(),
                 PATH_MAX,
                 || self.stream.0.read_directory_entry(),
@@ -1716,13 +1721,13 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_path_readlink(
             let file = ds.get_dir(fd)?;
             let path = if use_state_buf {
                 state
-                    .import_alloc
+                    .import_alloc[get_thread_index()]
                     .with_buffer(state.path_buf.get().cast(), PATH_MAX, || {
                         file.fd.readlink_at(path)
                     })?
             } else {
                 state
-                    .import_alloc
+                    .import_alloc[get_thread_index()]
                     .with_buffer(buf, buf_len, || file.fd.readlink_at(path))?
             };
 
@@ -1994,7 +1999,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_poll_oneoff(
             len: 0,
         };
 
-        state.import_alloc.with_buffer(
+        state.import_alloc[get_thread_index()].with_buffer(
             results.cast(),
             nsubscriptions
                 .checked_mul(size_of::<u32>())
@@ -2143,7 +2148,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_random_get(
         State::with(|state| {
             assert_eq!(buf_len as u32 as Size, buf_len);
             let result = state
-                .import_alloc
+                .import_alloc[get_thread_index()]
                 .with_buffer(buf, buf_len, || random::get_random_bytes(buf_len as u64));
             assert_eq!(result.as_ptr(), buf);
 
@@ -2455,6 +2460,8 @@ const DIRENT_CACHE: usize = 256;
 /// A canary value to detect memory corruption within `State`.
 const MAGIC: u32 = u32::from_le_bytes(*b"ugh!");
 
+const THREADS: usize = 16;
+
 #[repr(C)] // used for now to keep magic1 and magic2 at the start and end
 struct State {
     /// A canary constant value located at the beginning of this structure to
@@ -2462,7 +2469,7 @@ struct State {
     magic1: u32,
 
     /// Used to coordinate allocations of `cabi_import_realloc`
-    import_alloc: ImportAlloc,
+    import_alloc: [ImportAlloc; THREADS],
 
     /// Storage of mapping from preview1 file descriptors to preview2 file
     /// descriptors.
@@ -2564,7 +2571,7 @@ const fn bump_arena_size() -> usize {
     }
 
     // Remove miscellaneous metadata also stored in state.
-    let misc = if cfg!(feature = "proxy") { 7 } else { 14 };
+    let misc = if cfg!(feature = "proxy") { 7 } else { 14+45 };
     start -= misc * size_of::<usize>();
 
     // Everything else is the `command_data` allocation.
@@ -2655,7 +2662,7 @@ impl State {
         state.write(State {
             magic1: MAGIC,
             magic2: MAGIC,
-            import_alloc: ImportAlloc::new(),
+            import_alloc: std::array::from_fn(|_| ImportAlloc::new()),
             descriptors: RefCell::new(None),
             #[cfg(not(feature = "proxy"))]
             path_buf: UnsafeCell::new(MaybeUninit::uninit()),
@@ -2689,7 +2696,7 @@ impl State {
             .try_borrow_mut()
             .unwrap_or_else(|_| unreachable!());
         if d.is_none() {
-            *d = Some(Descriptors::new(&self.import_alloc, &self.long_lived_arena));
+            *d = Some(Descriptors::new(&self.import_alloc[get_thread_index()], &self.long_lived_arena));
         }
         RefMut::map(d, |d| d.as_mut().unwrap_or_else(|| unreachable!()))
     }
@@ -2701,7 +2708,7 @@ impl State {
             .try_borrow_mut()
             .unwrap_or_else(|_| unreachable!());
         if d.is_none() {
-            *d = Some(Descriptors::new(&self.import_alloc, &self.long_lived_arena));
+            *d = Some(Descriptors::new(&self.import_alloc[get_thread_index()], &self.long_lived_arena));
         }
         RefMut::map(d, |d| d.as_mut().unwrap_or_else(|| unreachable!()))
     }
@@ -2718,7 +2725,7 @@ impl State {
                 base: std::ptr::null(),
                 len: 0,
             };
-            self.import_alloc
+            self.import_alloc[get_thread_index()]
                 .with_arena(&self.long_lived_arena, || unsafe {
                     get_environment_import(&mut list as *mut _)
                 });
@@ -2743,7 +2750,7 @@ impl State {
                 base: std::ptr::null(),
                 len: 0,
             };
-            self.import_alloc
+            self.import_alloc[get_thread_index()]
                 .with_arena(&self.long_lived_arena, || unsafe {
                     get_args_import(&mut list as *mut _)
                 });
