@@ -78,6 +78,7 @@ impl Options {
     fn realloc<'a, T>(
         &self,
         store: &'a mut StoreContextMut<'_, T>,
+        realloc_ty: &FuncType,
         old: usize,
         old_size: usize,
         old_align: u32,
@@ -86,16 +87,13 @@ impl Options {
         self.store_id.assert_belongs_to(store.0.id());
 
         let realloc = self.realloc.unwrap();
-        let realloc_ty = FuncType::from_shared_type_index(store.engine(), unsafe {
-            realloc.as_ref().type_index
-        });
 
         // Invoke the wasm malloc function using its raw and statically known
         // signature.
         let result = unsafe {
             crate::TypedFunc::<(u32, u32, u32, u32), u32>::call_raw(
                 store,
-                &realloc_ty,
+                realloc_ty,
                 realloc,
                 (
                     u32::try_from(old)?,
@@ -247,8 +245,17 @@ impl<'a, T> LowerContext<'a, T> {
         old_align: u32,
         new_size: usize,
     ) -> Result<usize> {
+        let realloc_func_ty = Arc::clone(unsafe { (*self.instance).realloc_func_ty() });
+        let realloc_func_ty = realloc_func_ty.downcast_ref::<FuncType>().unwrap();
         self.options
-            .realloc(&mut self.store, old, old_size, old_align, new_size)
+            .realloc(
+                &mut self.store,
+                &realloc_func_ty,
+                old,
+                old_size,
+                old_align,
+                new_size,
+            )
             .map(|(_, ptr)| ptr)
     }
 
@@ -282,13 +289,21 @@ impl<'a, T> LowerContext<'a, T> {
     /// into a guest-local index.
     ///
     /// The `ty` provided is which table to put this into.
-    pub fn guest_resource_lower_own(&mut self, ty: TypeResourceTableIndex, rep: u32) -> u32 {
+    pub fn guest_resource_lower_own(
+        &mut self,
+        ty: TypeResourceTableIndex,
+        rep: u32,
+    ) -> Result<u32> {
         self.resource_tables().guest_resource_lower_own(rep, ty)
     }
 
     /// Lowers a `borrow` resource into the guest, converting the `rep` to a
     /// guest-local index in the `ty` table specified.
-    pub fn guest_resource_lower_borrow(&mut self, ty: TypeResourceTableIndex, rep: u32) -> u32 {
+    pub fn guest_resource_lower_borrow(
+        &mut self,
+        ty: TypeResourceTableIndex,
+        rep: u32,
+    ) -> Result<u32> {
         // Implement `lower_borrow`'s special case here where if a borrow is
         // inserted into a table owned by the instance which implemented the
         // original resource then no borrow tracking is employed and instead the
@@ -301,7 +316,7 @@ impl<'a, T> LowerContext<'a, T> {
         // Note that the unsafety here should be valid given the contract of
         // `LowerContext::new`.
         if unsafe { (*self.instance).resource_owned_by_own_instance(ty) } {
-            return rep;
+            return Ok(rep);
         }
         self.resource_tables().guest_resource_lower_borrow(rep, ty)
     }
@@ -323,7 +338,7 @@ impl<'a, T> LowerContext<'a, T> {
     ///
     /// Note that this is a special case for `Resource<T>`. Most of the time a
     /// host value shouldn't be lowered with a lowering context.
-    pub fn host_resource_lower_own(&mut self, rep: u32) -> HostResourceIndex {
+    pub fn host_resource_lower_own(&mut self, rep: u32) -> Result<HostResourceIndex> {
         self.resource_tables().host_resource_lower_own(rep)
     }
 
@@ -476,13 +491,13 @@ impl<'a> LiftContext<'a> {
 
     /// Lowers a resource into the host-owned table, returning the index it was
     /// inserted at.
-    pub fn host_resource_lower_own(&mut self, rep: u32) -> HostResourceIndex {
+    pub fn host_resource_lower_own(&mut self, rep: u32) -> Result<HostResourceIndex> {
         self.resource_tables().host_resource_lower_own(rep)
     }
 
     /// Lowers a resource into the host-owned table, returning the index it was
     /// inserted at.
-    pub fn host_resource_lower_borrow(&mut self, rep: u32) -> HostResourceIndex {
+    pub fn host_resource_lower_borrow(&mut self, rep: u32) -> Result<HostResourceIndex> {
         self.resource_tables().host_resource_lower_borrow(rep)
     }
 

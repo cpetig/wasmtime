@@ -1,7 +1,7 @@
 use super::{
     abi::X64ABI,
     address::Address,
-    asm::Assembler,
+    asm::{Assembler, PatchableAddToReg},
     regs::{self, rbp, rsp},
 };
 
@@ -10,14 +10,14 @@ use crate::masm::{
     RegImm, RemKind, RoundingMode, ShiftKind, TrapCode, TruncKind, TRUSTED_FLAGS, UNTRUSTED_FLAGS,
 };
 use crate::{
-    abi::ABI,
-    masm::{SPOffset, StackSlot},
-    stack::TypedReg,
-};
-use crate::{
     abi::{self, align_to, calculate_frame_adjustment, LocalSlot},
     codegen::{ptr_type_from_ptr_size, CodeGenContext, FuncEnv, HeapData, TableData},
     stack::Val,
+};
+use crate::{
+    abi::{vmctx, ABI},
+    masm::{SPOffset, StackSlot},
+    stack::TypedReg,
 };
 use crate::{
     isa::reg::{Reg, RegClass},
@@ -39,6 +39,13 @@ use wasmtime_environ::{PtrSize, WasmValType, WASM_PAGE_SIZE};
 pub(crate) struct MacroAssembler {
     /// Stack pointer offset.
     sp_offset: u32,
+    /// This value represents the maximum stack size seen while compiling the function. While the
+    /// function is still being compiled its value will not be valid (the stack will grow and
+    /// shrink as space is reserved and freed during compilation), but once all instructions have
+    /// been seen this value will be the maximum stack usage seen.
+    sp_max: u32,
+    /// Add instructions that are used to add the constant stack max to a register.
+    stack_max_use_add: Option<PatchableAddToReg>,
     /// Low level assembler.
     asm: Assembler,
     /// ISA flags.
@@ -70,12 +77,12 @@ impl Masm for MacroAssembler {
             .mov_rr(stack_pointer, frame_pointer, OperandSize::S64);
     }
 
-    fn check_stack(&mut self) {
+    fn check_stack(&mut self, vmctx: Reg) {
         let ptr_size: u8 = self.ptr_size.bytes().try_into().unwrap();
         let scratch = regs::scratch();
 
         self.load_ptr(
-            self.address_at_vmctx(ptr_size.vmcontext_runtime_limits().into()),
+            self.address_at_reg(vmctx, ptr_size.vmcontext_runtime_limits().into()),
             scratch,
         );
 
@@ -83,6 +90,8 @@ impl Masm for MacroAssembler {
             Address::offset(scratch, ptr_size.vmruntime_limits_stack_limit().into()),
             scratch,
         );
+
+        self.add_stack_max(scratch);
 
         self.asm.cmp_rr(regs::rsp(), scratch, self.ptr_size);
         self.asm.trapif(IntCmpKind::GtU, TrapCode::StackOverflow);
@@ -101,7 +110,7 @@ impl Masm for MacroAssembler {
                     RegClass::Float => align_to(total, float_bytes) + float_bytes,
                     RegClass::Vector => unimplemented!(),
                 }),
-            16,
+            float_bytes,
         );
 
         // Emit unwind info.
@@ -139,6 +148,9 @@ impl Masm for MacroAssembler {
     }
 
     fn restore_clobbers(&mut self, clobbers: &[(Reg, OperandSize)]) {
+        let int_bytes: u32 = Self::ABI::word_bytes().try_into().unwrap();
+        let float_bytes = int_bytes * 2;
+
         let mut off = 0;
         for &(reg, size) in clobbers {
             // Align the current offset
@@ -152,7 +164,7 @@ impl Masm for MacroAssembler {
             off += size.bytes();
         }
 
-        self.free_stack(align_to(off, 16));
+        self.free_stack(align_to(off, float_bytes));
     }
 
     fn push(&mut self, reg: Reg, size: OperandSize) -> StackSlot {
@@ -231,7 +243,6 @@ impl Masm for MacroAssembler {
         table_data: &TableData,
         context: &mut CodeGenContext,
     ) -> Self::Address {
-        let vmctx = <Self::ABI as ABI>::vmctx_reg();
         let scratch = regs::scratch();
         let bound = context.any_gpr(self);
         let tmp = context.any_gpr(self);
@@ -249,7 +260,7 @@ impl Masm for MacroAssembler {
         } else {
             // Else, simply move the vmctx register into the addr register as
             // the base to calculate the table address.
-            self.asm.mov_rr(vmctx, ptr_base, self.ptr_size);
+            self.asm.mov_rr(vmctx!(Self), ptr_base, self.ptr_size);
         };
 
         // OOB check.
@@ -293,7 +304,6 @@ impl Masm for MacroAssembler {
     }
 
     fn table_size(&mut self, table_data: &TableData, context: &mut CodeGenContext) {
-        let vmctx = <Self::ABI as ABI>::vmctx_reg();
         let scratch = regs::scratch();
         let size = context.any_gpr(self);
 
@@ -305,7 +315,7 @@ impl Masm for MacroAssembler {
                 TRUSTED_FLAGS,
             );
         } else {
-            self.asm.mov_rr(vmctx, scratch, self.ptr_size);
+            self.asm.mov_rr(vmctx!(Self), scratch, self.ptr_size);
         };
 
         let size_addr = Address::offset(scratch, table_data.current_elems_offset);
@@ -322,7 +332,6 @@ impl Masm for MacroAssembler {
     fn memory_size(&mut self, heap_data: &HeapData, context: &mut CodeGenContext) {
         let size_reg = context.any_gpr(self);
         let scratch = regs::scratch();
-        let vmctx = <Self::ABI as ABI>::vmctx_reg();
 
         let base = if let Some(offset) = heap_data.import_from {
             self.asm.movzx_mr(
@@ -333,7 +342,7 @@ impl Masm for MacroAssembler {
             );
             scratch
         } else {
-            vmctx
+            vmctx!(Self)
         };
 
         let size_addr = Address::offset(base, heap_data.current_length_offset);
@@ -371,7 +380,7 @@ impl Masm for MacroAssembler {
     }
 
     fn address_at_vmctx(&self, offset: u32) -> Self::Address {
-        Address::offset(<Self::ABI as ABI>::vmctx_reg(), offset)
+        Address::offset(vmctx!(Self), offset)
     }
 
     fn store_ptr(&mut self, src: Reg, dst: Self::Address) {
@@ -802,7 +811,11 @@ impl Masm for MacroAssembler {
         self.asm.ret();
     }
 
-    fn finalize(self) -> MachBufferFinalized<Final> {
+    fn finalize(mut self) -> MachBufferFinalized<Final> {
+        if let Some(patch) = self.stack_max_use_add {
+            patch.finalize(i32::try_from(self.sp_max).unwrap(), self.asm.buffer_mut());
+        }
+
         self.asm.finalize()
     }
 
@@ -1163,6 +1176,8 @@ impl MacroAssembler {
 
         Self {
             sp_offset: 0,
+            sp_max: 0,
+            stack_max_use_add: None,
             asm: Assembler::new(shared_flags.clone(), isa_flags.clone()),
             flags: isa_flags,
             shared_flags,
@@ -1170,8 +1185,22 @@ impl MacroAssembler {
         }
     }
 
+    /// Add the maximum stack used to a register, recording an obligation to update the
+    /// add-with-immediate instruction emitted to use the real stack max when the masm is being
+    /// finalized.
+    fn add_stack_max(&mut self, reg: Reg) {
+        assert!(self.stack_max_use_add.is_none());
+        let patch = PatchableAddToReg::new(reg, OperandSize::S64, self.asm.buffer_mut());
+        self.stack_max_use_add.replace(patch);
+    }
+
     fn increment_sp(&mut self, bytes: u32) {
         self.sp_offset += bytes;
+
+        // NOTE: we use `max` here to track the largest stack allocation in `sp_max`. Once we have
+        // seen the entire function, this value will represent the maximum size for the stack
+        // frame.
+        self.sp_max = self.sp_max.max(self.sp_offset);
     }
 
     fn decrement_sp(&mut self, bytes: u32) {
