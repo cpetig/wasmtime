@@ -11,7 +11,6 @@
         unreachable_code
     )
 )]
-#![feature(thread_id_value)]
 
 use crate::bindings::wasi::clocks::{monotonic_clock, wall_clock};
 use crate::bindings::wasi::io::poll;
@@ -26,6 +25,7 @@ use core::mem::{self, align_of, forget, size_of, ManuallyDrop, MaybeUninit};
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, null_mut};
 use core::slice;
+use std::sync::atomic::{AtomicU8, Ordering};
 use poll::Pollable;
 use wasi::*;
 
@@ -47,8 +47,13 @@ mod macros;
 mod descriptors;
 use crate::descriptors::{Descriptor, Descriptors, StreamType, Streams};
 
+thread_local!{
+    static THREAD_INDEX: AtomicU8 = AtomicU8::new(NEXT_THREAD_INDEX.fetch_add(1, Ordering::SeqCst) % THREADS as u8);
+}
+static NEXT_THREAD_INDEX: AtomicU8 = AtomicU8::new(0);
+
 fn get_thread_index() -> usize {
-    (std::thread::current().id().as_u64().get() as usize) % THREADS
+    THREAD_INDEX.with(|t| t.load(Ordering::SeqCst)).into()
 }
 
 pub mod bindings {
@@ -248,6 +253,7 @@ impl ImportAlloc {
     /// Use the provided buffer to satisfy that import allocation. The user is responsible
     /// for making sure allocated imports are not used beyond the lifetime of the buffer.
     fn with_buffer<T>(&self, buffer: *mut u8, len: usize, f: impl FnOnce() -> T) -> T {
+        unsafe {_mydebug(1, buffer as usize, len)};
         if self.arena.get().is_some() {
             unreachable!("arena mode")
         }
@@ -265,6 +271,7 @@ impl ImportAlloc {
     /// Use the provided BumpArena to satisfry those allocations. The user is responsible
     /// for making sure allocated imports are not used beyond the lifetime of the arena.
     fn with_arena<T>(&self, arena: &BumpArena, f: impl FnOnce() -> T) -> T {
+        unsafe {_mydebug(2, 0, 0)};
         if !self.buffer.get().is_null() {
             unreachable!("buffer mode")
         }
@@ -283,14 +290,17 @@ impl ImportAlloc {
     /// To be used by cabi_import_realloc only!
     fn alloc(&self, align: usize, size: usize) -> *mut u8 {
         if let Some(arena) = self.arena.get() {
+            unsafe{_mydebug(4, align, size)};
             arena.alloc(align, size)
         } else {
             let buffer = self.buffer.get();
             if buffer.is_null() {
+                unsafe{_mydebug(5, align, size)};
                 return unsafe { malloc(size) }.cast();
             }
             let buffer = buffer as usize;
             let alloc = align_to(buffer, align);
+            unsafe{_mydebug(6, buffer, size)};
             if alloc.checked_add(size).trapping_unwrap()
                 > buffer.checked_add(self.len.get()).trapping_unwrap()
             {
@@ -1869,6 +1879,9 @@ impl Drop for Pollables {
     }
 }
 
+//extern "C" { fn _mydebug(a: usize, b: usize, c: usize); }
+fn _mydebug(a: usize, b: usize, c: usize) {}
+
 /// Concurrently poll for the occurrence of a set of events.
 #[no_mangle]
 pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_poll_oneoff(
@@ -1877,6 +1890,8 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_poll_oneoff(
     nsubscriptions: Size,
     nevents: *mut Size,
 ) -> Errno {
+    _mydebug(0, get_thread_index(), 0);
+
     *nevents = 0;
 
     let subscriptions = slice::from_raw_parts(r#in, nsubscriptions);
@@ -2014,6 +2029,7 @@ pub unsafe extern "C" fn __imported_wasi_snapshot_preview1_poll_oneoff(
         );
 
         assert!(ready_list.len <= nsubscriptions);
+        _mydebug(3, ready_list.base as usize, results as usize);
         assert_eq!(ready_list.base, results as *const u32);
 
         drop(pollables);
