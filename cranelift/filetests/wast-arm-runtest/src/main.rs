@@ -29,7 +29,7 @@ fn main() {
         Some(p) => p,
         None => {
             eprintln!(
-                "usage: wast-arm-runtest [--spike] [--c-driver] [--one] [--stop-on-error] <file.wast>"
+                "usage: wast-arm-runtest [--stop-on-error] <file.wast>"
             );
             std::process::exit(1);
         }

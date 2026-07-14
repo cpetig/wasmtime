@@ -12,7 +12,7 @@ use crate::ir::{
     immediates::*,
     types::*,
 };
-use crate::isa::arm32::Arm32Backend;
+use crate::isa::arm32::{Arm32Backend, inst::AMode};
 use crate::machinst::{
     ArgPair, CallArgList, CallRetList, InstOutput, MachInst, Reg, TryCallInfo, VCodeConstant,
     VCodeConstantData, isle::*,
@@ -39,12 +39,15 @@ pub(crate) fn lower(
 
 /// The main entry point for branch lowering with ISLE.
 pub(crate) fn lower_branch(
-    _lower_ctx: &mut Lower<generated_code::MInst>,
-    _backend: &Arm32Backend,
-    _branch: Inst,
-    _targets: &[MachLabel],
+    lower_ctx: &mut Lower<generated_code::MInst>,
+    backend: &Arm32Backend,
+    branch: Inst,
+    targets: &[MachLabel],
 ) -> Option<()> {
-    todo!()
+    // TODO: reuse the ISLE context across lowerings so we can reuse its
+    // internal heap allocations.
+    let mut isle_ctx = IsleContext{lower_ctx, backend};
+    generated_code::constructor_lower_branch(&mut isle_ctx, branch, targets)
 }
 
 impl generated_code::Context for IsleContext<'_, '_, MInst, Arm32Backend> {

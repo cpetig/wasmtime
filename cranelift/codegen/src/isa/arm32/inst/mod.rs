@@ -2,11 +2,11 @@
 
 use crate::alloc::{borrow::ToOwned, vec::Vec};
 use crate::binemit::CodeOffset;
+use crate::ir::MemFlagsData;
 use crate::ir::types::{I8, I16, I32, I64, I128, Type};
 use crate::isa::{FunctionAlignment, arm32};
 use crate::machinst::{
-    ArgPair, CallType, MachInst, MachInstLabelUse, MachTerminator, OperandVisitor,
-    OperandVisitorImpl, Reg, RegClass, RetPair, Writable,
+    ArgPair, CallType, MachInst, MachInstLabelUse, MachTerminator, OperandVisitor, OperandVisitorImpl, Reg, RegClass, RetPair, StackAMode, Writable,
 };
 use crate::{CodegenError, CodegenResult};
 
@@ -32,11 +32,37 @@ impl Inst {
             preferred: 4,
         }
     }
+
+    /// Create a load instruction.
+    pub fn gen_load(into_reg: Writable<Reg>, mem: AMode, ty: Type, _flags: MemFlagsData) -> Inst {
+        Inst::Load {
+            rd: into_reg,
+            mem,
+            ty,
+        }
+    }
+
+    /// Create a store instruction.
+    pub fn gen_store(mem: AMode, from_reg: Reg, ty: Type, _flags: MemFlagsData) -> Inst {
+        Inst::Store {
+            rs: from_reg,
+            mem,
+            ty,
+        }
+    }
 }
 
 // ===========================================================================
 // Operand collection for register allocation.
 // ===========================================================================
+
+/// Extract base register(s) from an addressing mode for operand collection.
+fn amode_get_operands(amode: &mut AMode, collector: &mut impl OperandVisitor) {
+    match amode {
+        AMode::RegOffset(base, _) => collector.reg_use(base),
+        AMode::SPOffset(_) => {} // SP is fixed; no additional register operand.
+    }
+}
 
 /// Collect def/use operands from an instruction into the collector,
 /// so regalloc sees correct operand information. Model on riscv64_get_operands.
@@ -63,6 +89,18 @@ fn arm32_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             for RetPair { vreg, preg } in rets {
                 collector.reg_fixed_use(vreg, *preg);
             }
+        }
+
+        // Load Rd, [base, offset] — def rd, uses from mem.
+        Inst::Load { rd, mem, .. } => {
+            amode_get_operands(mem, collector);
+            collector.reg_def(rd);
+        }
+
+        // Store Rs, [base, offset] — use rs, uses from mem.
+        Inst::Store { rs, mem, .. } => {
+            amode_get_operands(mem, collector);
+            collector.reg_use(rs);
         }
     }
 }
@@ -222,5 +260,29 @@ impl MachInstLabelUse for LabelUse {
 
     fn from_reloc(_reloc: crate::binemit::Reloc, _addend: crate::binemit::Addend) -> Option<Self> {
         todo!()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum AMode {
+    RegOffset(Reg, i64),
+    SPOffset(i64),
+}
+
+impl From<StackAMode> for AMode {
+    fn from(stack: StackAMode) -> Self {
+        match stack {
+            StackAMode::IncomingArg(offset, _) => {
+                // Incoming args are accessed via FP (r11).
+                let base = regs::fp_reg();
+                AMode::RegOffset(base, -offset)
+            }
+            StackAMode::OutgoingArg(offset) => AMode::SPOffset(-offset),
+            StackAMode::Slot(offset) => {
+                // Fixed frame storage is accessed via FP.
+                let base = regs::fp_reg();
+                AMode::RegOffset(base, offset)
+            }
+        }
     }
 }

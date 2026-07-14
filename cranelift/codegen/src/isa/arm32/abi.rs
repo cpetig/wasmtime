@@ -1,7 +1,9 @@
 //! Implementation of a standard ARM32 ABI (AAPCS).
 
 use crate::alloc::{borrow::ToOwned, vec::Vec};
+use crate::ir::MemFlagsData;
 use crate::ir::{self, Type, types::I32};
+use crate::isa::arm32::inst::AMode;
 use crate::isa::{
     self, CallConv,
     arm32::{inst::Inst, lower::regs::x_reg, settings::Flags as Arm32Flags},
@@ -257,11 +259,12 @@ impl ABIMachineSpec for Arm32MachineDeps {
     }
 
     fn get_stacklimit_reg(_call_conv: CallConv) -> Reg {
-        todo!()
+        x_reg(0)
     }
 
-    fn gen_load_base_offset(_into_reg: Writable<Reg>, _base: Reg, _offset: i32, _ty: Type) -> Inst {
-        todo!()
+    fn gen_load_base_offset(into_reg: Writable<Reg>, base: Reg, offset: i32, ty: Type) -> Inst {
+        let mem = AMode::RegOffset(base, i64::from(offset));
+        Inst::gen_load(into_reg, mem, ty, MemFlagsData::trusted())
     }
 
     fn gen_store_base_offset(_base: Reg, _offset: i32, _from_reg: Reg, _ty: Type) -> Inst {

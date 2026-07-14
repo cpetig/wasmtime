@@ -1,6 +1,10 @@
 ;; ARM32 machine instruction definitions (MInst) and helper constructors.
 ;; Mirrors the Rust Inst enum in inst/mod.rs.
 
+;;;;;;; AMode — must match Rust enum in inst/mod.rs ;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(type AMode (primitive AMode))
+
 ;; Register bitmask for push/pop instructions.
 (type PushMask (primitive u16))
 
@@ -27,4 +31,9 @@
         ;; The `rt` field encodes register bitmask as u16.
         (Pop (rt PushMask))
 
+        ;; Load register: LDR Rd, [base, offset]
+        (Load (rd WritableReg) (mem AMode) (ty Type))
+
+        ;; Store register: STR Rs, [base, offset]
+        (Store (rs Reg) (mem AMode) (ty Type))
     ))

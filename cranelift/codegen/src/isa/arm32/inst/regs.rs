@@ -39,3 +39,8 @@ pub fn pretty_print_reg(reg: Reg) -> String {
         }
     }
 }
+
+#[inline]
+pub fn fp_reg() -> Reg {
+    x_reg(11)
+}
