@@ -167,6 +167,7 @@ resolver = '2'
 members = [
   "cranelift",
   "cranelift/assembler-x64/fuzz",
+  "cranelift/filetests/wast-arm-runtest",
   "cranelift/isle/fuzz",
   "cranelift/isle/islec",
   "cranelift/isle/veri/aslp",
