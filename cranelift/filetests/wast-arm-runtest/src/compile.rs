@@ -93,7 +93,7 @@ pub fn compile_wasm_function<'data>(
 pub fn emit_object_file(
     bytes: &[u8],
     alignment: u32,
-    translation: &wasmtime_environ::ModuleTranslation<'_>,
+    _translation: &wasmtime_environ::ModuleTranslation<'_>,
 ) -> Result<Vec<u8>> {
     let triple_str = "thumbv7em-none-eabihf";
     let triple = Triple::from_str(triple_str)
@@ -242,7 +242,7 @@ mod tests {
 }
 
 /// Generate C driver source code for testing the compiled wasm function
-pub fn generate_c_driver(store_ctx_off: u32, stack_limit_off: u32) -> String {
+pub fn generate_c_driver(store_ctx_off: u32, _stack_limit_off: u32) -> String {
     let sc_base = 64u32;
 
     format!(

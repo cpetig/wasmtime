@@ -15,7 +15,7 @@ impl Case {
         field: &str,
         args: &[Const],
         expected: &[Const],
-        verbose: bool,
+        _verbose: bool,
     ) -> Result<Option<Case>, String> {
         let args: Vec<i32> = args
             .iter()
@@ -47,7 +47,7 @@ impl Case {
 }
 
 fn module_exports_func(module: &[u8], name: &str) -> bool {
-    let mut parser = Parser::new(0);
+    let parser = Parser::new(0);
     for payload in parser.parse_all(module) {
         if let Ok(payload) = payload {
             if let wasmparser::Payload::ExportSection(reader) = payload {

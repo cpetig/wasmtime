@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -12,19 +12,19 @@ pub enum CaseOutcome {
     Skip(String),
 }
 
-impl CaseOutcome {
-    pub fn is_pass(&self) -> bool {
-        matches!(self, CaseOutcome::Pass)
-    }
+// impl CaseOutcome {
+//     pub fn is_pass(&self) -> bool {
+//         matches!(self, CaseOutcome::Pass)
+//     }
 
-    pub fn is_fail(&self) -> bool {
-        matches!(self, CaseOutcome::Fail(_))
-    }
+//     pub fn is_fail(&self) -> bool {
+//         matches!(self, CaseOutcome::Fail(_))
+//     }
 
-    pub fn is_skip(&self) -> bool {
-        matches!(self, CaseOutcome::Skip(_))
-    }
-}
+//     pub fn is_skip(&self) -> bool {
+//         matches!(self, CaseOutcome::Skip(_))
+//     }
+// }
 
 pub fn run_case_single(case: &Case, workdir: &Path) -> Result<CaseOutcome> {
     // Step 1: Build compiler
@@ -174,7 +174,7 @@ fn find_export_func_index(
 fn emit_object_file_with_trampoline(
     bytes: &[u8],
     alignment: u32,
-    translation: &wasmtime_environ::ModuleTranslation<'_>,
+    _translation: &wasmtime_environ::ModuleTranslation<'_>,
     export_name: &str,
     arity: usize,
 ) -> Result<Vec<u8>> {
@@ -275,7 +275,7 @@ struct VmctxOffsets {
 
 fn generate_c_driver(
     store_ctx_off: u32,
-    stack_limit_off: u32,
+    _stack_limit_off: u32,
     args: &[i32],
     expected: i32,
 ) -> String {

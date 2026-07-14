@@ -8,10 +8,9 @@ use anyhow::Result;
 use parse::parse_wast_file;
 use report::Report;
 use std::path::Path;
-use wasmtime_environ::{PtrSize, VMOffsets};
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let args = std::env::args().skip(1);
 
     let mut path: Option<String> = None;
     let mut verbose = false;
@@ -118,7 +117,7 @@ fn process_all_cases(path: &Path, verbose: bool, stop_on_error: bool) -> Result<
         let _ = std::fs::remove_dir_all(&workdir_path);
     } else {
         // Keep the temp dir from being deleted by TempDir's Drop
-        workdir.keep();
+        let _ = workdir.keep();
         eprintln!(
             "Preserving temp directory for debugging: {}",
             workdir_path.display()

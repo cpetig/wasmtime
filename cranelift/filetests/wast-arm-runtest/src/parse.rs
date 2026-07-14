@@ -5,7 +5,7 @@ use std::path::Path;
 
 pub struct ParsedWast {
     pub cases: Vec<Case>,
-    pub skipped: u32,
+    // pub skipped: u32,
     pub command_count: usize,
     pub module_count: usize,
 }
@@ -67,7 +67,7 @@ pub fn parse_wast_file(path: &Path, verbose: bool) -> Result<ParsedWast> {
 
     Ok(ParsedWast {
         cases,
-        skipped,
+        // skipped,
         command_count,
         module_count,
     })
