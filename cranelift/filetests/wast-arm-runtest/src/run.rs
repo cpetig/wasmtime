@@ -96,14 +96,14 @@ pub fn run_cases_batch(cases: &[Case], workdir: &Path, verbose: bool) -> Result<
     let obj_path = workdir.join("module.o");
     std::fs::write(&obj_path, &obj_bytes)?;
 
-    let c_source = generate_c_driver(&compiled_cases, verbose);
-    let driver_path = workdir.join("driver.c");
-    std::fs::write(&driver_path, &c_source)?;
+    let rust_source = generate_rust_driver(&compiled_cases, verbose);
+    let driver_path = workdir.join("driver.rs");
+    std::fs::write(&driver_path, &rust_source)?;
 
     let elf_path = workdir.join("program");
     let toolchain = locate_toolchain()?;
-    link_with_gcc(
-        &toolchain.compiler,
+    link_with_rustc(
+        &toolchain.linker,
         &toolchain.sysroot,
         &obj_path,
         &driver_path,
@@ -182,6 +182,23 @@ fn make_case_runner_name(index: usize, export_name: &str) -> String {
         "run_case_{index}_{}",
         make_case_symbol_name(index, export_name)
     )
+}
+
+fn sanitize_rust_ident(ident: &str) -> String {
+    let mut sanitized = String::new();
+    let mut prev_was_underscore = false;
+
+    for ch in ident.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch);
+            prev_was_underscore = false;
+        } else if !prev_was_underscore {
+            sanitized.push('_');
+            prev_was_underscore = true;
+        }
+    }
+
+    sanitized.trim_matches('_').to_string()
 }
 
 fn make_compiled_case_key(case: &Case) -> String {
@@ -395,22 +412,22 @@ impl CaseValue {
     }
 
     fn c_type_name(self) -> &'static str {
-        self.dispatch(|_| "int", |_| "long long", |_| "float", |_| "double")
+        self.dispatch(|_| "i32", |_| "i64", |_| "f32", |_| "f64")
     }
 
     fn c_assignment(self, index: usize) -> String {
         self.dispatch(
-            |value| format!("    int a{index} = {value};"),
-            |value| format!("    long long a{index} = {value}LL;"),
+            |value| format!("    let a{index} = {value};"),
+            |value| format!("    let a{index} = {value}i64;"),
             |bits| {
                 format!(
-                    "    float a{index} = bits_to_f32(0x{:08x}u);",
+                    "    let a{index} = bits_to_f32(0x{:08x}_u32);",
                     bits.to_bits()
                 )
             },
             |bits| {
                 format!(
-                    "    double a{index} = bits_to_f64(0x{:016x}ULL);",
+                    "    let a{index} = bits_to_f64(0x{:016x}_u64);",
                     bits.to_bits()
                 )
             },
@@ -419,17 +436,17 @@ impl CaseValue {
 
     fn c_compare_stmt(self, got_name: &str) -> String {
         self.dispatch(
-            |value| format!("    int passed = ({got_name} == {value});"),
-            |value| format!("    int passed = ({got_name} == {value}LL);"),
+            |value| format!("    let passed = {got_name} == {value};"),
+            |value| format!("    let passed = {got_name} == {value}i64;"),
             |bits| {
                 format!(
-                    "    int passed = (f32_to_bits({got_name}) == 0x{:08x}u);",
+                    "    let passed = f32_to_bits({got_name}) == 0x{:08x}_u32;",
                     bits.to_bits()
                 )
             },
             |bits| {
                 format!(
-                    "    int passed = (f64_to_bits({got_name}) == 0x{:016x}ULL);",
+                    "    let passed = f64_to_bits({got_name}) == 0x{:016x}_u64;",
                     bits.to_bits()
                 )
             },
@@ -443,10 +460,10 @@ impl CaseValue {
 
     fn c_got_literal_stmt(self) -> String {
         self.dispatch(
-            |_| "    char got_literal_buf[64];\n    snprintf(got_literal_buf, sizeof(got_literal_buf), \"%d\", got);\n    const char *got_literal = got_literal_buf;".to_string(),
-            |_| "    char got_literal_buf[64];\n    snprintf(got_literal_buf, sizeof(got_literal_buf), \"%lld\", got);\n    const char *got_literal = got_literal_buf;".to_string(),
-            |_| "    char got_literal_buf[64];\n    snprintf(got_literal_buf, sizeof(got_literal_buf), \"%f\", got);\n    const char *got_literal = got_literal_buf;".to_string(),
-            |_| "    char got_literal_buf[64];\n    snprintf(got_literal_buf, sizeof(got_literal_buf), \"%f\", got);\n    const char *got_literal = got_literal_buf;".to_string(),
+            |_| "    let got_literal = got.to_string();".to_string(),
+            |_| "    let got_literal = got.to_string();".to_string(),
+            |_| "    let got_literal = f32_to_literal(f32_to_bits(got));".to_string(),
+            |_| "    let got_literal = f64_to_literal(f64_to_bits(got));".to_string(),
         )
     }
 }
@@ -458,7 +475,7 @@ fn format_c_arg_params(args: &[CaseValue]) -> String {
         let params = args
             .iter()
             .enumerate()
-            .map(|(i, arg)| format!(" {} a{}", arg.c_type_name(), i))
+            .map(|(i, arg)| format!(" a{}: {}", i, arg.c_type_name()))
             .collect::<Vec<_>>()
             .join(",");
         format!(", {}", params)
@@ -480,24 +497,18 @@ fn format_c_arg_calls(args: &[CaseValue]) -> String {
 }
 
 fn c_driver_helpers(verbose: bool) -> String {
-    let verbose_define = if verbose { "1" } else { "0" };
+    let verbose_value = if verbose { "true" } else { "false" };
     let mut helper = String::from(
-        "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n\n#define WAST_ARM_RUNTTEST_VERBOSE ",
+        "use std::fmt::Write;\n\nfn bits_to_f32(bits: u32) -> f32 { f32::from_bits(bits) }\n\nfn bits_to_f64(bits: u64) -> f64 { f64::from_bits(bits) }\n\nfn f32_to_bits(value: f32) -> u32 { value.to_bits() }\n\nfn f64_to_bits(value: f64) -> u64 { value.to_bits() }\n\nfn f32_to_literal(bits: u32) -> String {\n    match bits {\n        0x0000_0000 => \"0x0p+0\".to_string(),\n        0x8000_0000 => \"-0x0p+0\".to_string(),\n        _ if (bits & 0x7f80_0000) == 0x7f80_0000 => {\n            if (bits & 0x0040_0000) == 0 {\n                \"nan:canonical\".to_string()\n            } else {\n                \"nan:arithmetic\".to_string()\n            }\n        }\n        _ => format!(\"{:?}\", bits_to_f32(bits)),\n    }\n}\n\nfn f64_to_literal(bits: u64) -> String {\n    match bits {\n        0x0000_0000_0000_0000 => \"0x0p+0\".to_string(),\n        0x8000_0000_0000_0000 => \"-0x0p+0\".to_string(),\n        _ if (bits & 0x7ff0_0000_0000_0000) == 0x7ff0_0000_0000_0000 => {\n            if (bits & 0x0008_0000_0000_0000) == 0 {\n                \"nan:canonical\".to_string()\n            } else {\n                \"nan:arithmetic\".to_string()\n            }\n        }\n        _ => format!(\"{:?}\", bits_to_f64(bits)),\n    }\n}\n\nconst WAST_ARM_RUNTTEST_VERBOSE: bool = ",
     );
-    helper.push_str(verbose_define);
-    helper.push_str(
-        "\n\nstatic float bits_to_f32(uint32_t bits) {\n    float out;\n    memcpy(&out, &bits, sizeof(out));\n    return out;\n}\n\nstatic double bits_to_f64(uint64_t bits) {\n    double out;\n    memcpy(&out, &bits, sizeof(out));\n    return out;\n}\n\nstatic uint32_t f32_to_bits(float value) {\n    uint32_t bits;\n    memcpy(&bits, &value, sizeof(bits));\n    return bits;\n}\n\nstatic uint64_t f64_to_bits(double value) {\n    uint64_t bits;\n    memcpy(&bits, &value, sizeof(bits));\n    return bits;\n}\n\nstatic const char *f32_to_literal(uint32_t bits) {\n    static char buf[64];\n    float value = bits_to_f32(bits);\n    if (bits == 0x00000000u) return \"0x0p+0\";\n    if (bits == 0x80000000u) return \"-0x0p+0\";\n    if ((bits & 0x7f800000u) == 0x7f800000u) {\n        if ((bits & 0x00400000u) == 0) return \"nan:canonical\";\n        return \"nan:arithmetic\";\n    }\n    snprintf(buf, sizeof(buf), \"%a\", (double)value);\n    return buf;\n}\n\nstatic const char *f64_to_literal(uint64_t bits) {\n    static char buf[64];\n    double value = bits_to_f64(bits);\n    if (bits == 0x0000000000000000ULL) return \"0x0p+0\";\n    if (bits == 0x8000000000000000ULL) return \"-0x0p+0\";\n    if ((bits & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL) {\n        if ((bits & 0x0008000000000000ULL) == 0) return \"nan:canonical\";\n        return \"nan:arithmetic\";\n    }\n    snprintf(buf, sizeof(buf), \"%a\", value);\n    return buf;\n}\n",
-    );
+    helper.push_str(verbose_value);
+    helper.push_str(";\n");
     helper
 }
 
-fn c_driver_prototype(ret_ty: &str, export_name: &str, args_params: &str) -> String {
-    format!("extern {ret_ty} {export_name}(void *vmctx, void *caller_vmctx{args_params});")
-}
-
-struct CDriverMainContext<'a> {
+struct DriverMainContext<'a> {
     store_ctx_off: u32,
-    sc_base: u32,
+    sc_base: usize,
     export_name: &'a str,
     runner_name: &'a str,
     case_label: &'a str,
@@ -509,8 +520,8 @@ struct CDriverMainContext<'a> {
     expected_literal: &'a str,
 }
 
-fn c_driver_main(context: CDriverMainContext<'_>) -> String {
-    let CDriverMainContext {
+fn rust_driver_main(context: DriverMainContext<'_>, verbose: bool) -> String {
+    let DriverMainContext {
         store_ctx_off,
         sc_base,
         export_name,
@@ -524,34 +535,89 @@ fn c_driver_main(context: CDriverMainContext<'_>) -> String {
         expected_literal,
     } = context;
 
+    let pass_stmt = if verbose {
+        format!(
+            "    println!(\"PASS case {case_label}: {{}}\", {expected_literal});\n",
+            case_label = case_label,
+            expected_literal = expected_literal,
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        "int {runner_name}(void) {{\n\
-            unsigned char buf[256] = {{0}};\n\
-            // VMContext.store_context (at STORE_CTX_OFF) -> points at buf+SC_BASE\n\
-            *(uintptr_t*)(buf + {store_ctx_off}) = (uintptr_t)(buf + {sc_base});\n\
-            // VMStoreContext.stack_limit at SC_BASE + STACK_LIMIT_OFF is 0 (buf is zero-initialized)\n\
+        "fn {runner_name}() -> bool {{\n\
+            let mut buf = [0u8; 256];\n\
+            unsafe {{\n                let store_ptr = buf.as_mut_ptr().add({store_ctx_off}) as *mut usize;\n\
+                *store_ptr = buf.as_mut_ptr().add({sc_base}) as usize;\n\
+            }}\n\
             {arg_assignments}\n\
-            {got_decl} = {export_name}((void*)buf, (void*)buf{args_call});\n\
+            {got_decl}\n\
+            let got = unsafe {{ {export_name}(buf.as_mut_ptr(), buf.as_mut_ptr(){args_call}) }};\n\
             {got_literal_stmt}\n\
             {compare_stmt}\n\
-            if (passed) {{\n\
-                return 0;\n\
+            if passed {{\n\
+                {pass_stmt}\
             }} else {{\n\
-                printf(\"FAIL case {case_label}: expected %s, got %s\\n\", {expected_literal}, got_literal);\n\
-                return 1;\n\
+                println!(\"FAIL case {case_label}: expected {{}} , got {{}}\", {expected_literal}, got_literal);\n\
             }}\n\
-        }}"
+            passed\n\
+        }}\n",
+        runner_name = runner_name,
+        store_ctx_off = store_ctx_off,
+        sc_base = sc_base,
+        arg_assignments = arg_assignments,
+        got_decl = got_decl,
+        export_name = export_name,
+        args_call = args_call,
+        got_literal_stmt = got_literal_stmt,
+        compare_stmt = compare_stmt,
+        pass_stmt = pass_stmt,
+        case_label = case_label,
+        expected_literal = expected_literal,
     )
 }
 
-fn generate_c_driver(cases: &[PreparedCase], verbose: bool) -> String {
-    let sc_base = 64u32;
+fn generate_rust_driver(cases: &[PreparedCase], verbose: bool) -> String {
+    let sc_base = 64usize;
     let mut driver = String::new();
     driver.push_str(&c_driver_helpers(verbose));
-    driver.push_str("\n\n");
+    driver.push('\n');
 
+    let mut declared_exports = HashSet::new();
+    driver.push_str("extern \"C\" {\n");
     for case in cases {
         let args_params_str = format_c_arg_params(&case.args);
+        let ret_ty = case.expected.c_type_name();
+        let exported_name = exported_symbol_name(&case.symbol_name);
+        if declared_exports.contains(&exported_name) {
+            continue;
+        }
+        declared_exports.insert(exported_name.clone());
+        driver.push_str(&format!(
+            "    fn {exported_name}(vmctx: *mut u8, caller_vmctx: *mut u8{args_params_str}) -> {ret_ty};\n"
+        ));
+    }
+    driver.push_str("}\n\n");
+
+    let mut emitted_wrappers = HashSet::new();
+    for case in cases {
+        let exported_name = exported_symbol_name(&case.symbol_name);
+        let wrapper_name = format!("{}_wrapper", sanitize_rust_ident(&exported_name));
+        if emitted_wrappers.contains(&wrapper_name) {
+            continue;
+        }
+        emitted_wrappers.insert(wrapper_name.clone());
+        let args_params_str = format_c_arg_params(&case.args);
+        let ret_ty = case.expected.c_type_name();
+        let args_call_str = format_c_arg_calls(&case.args);
+        driver.push_str(&format!(
+            "fn {wrapper_name}(vmctx: *mut u8, caller_vmctx: *mut u8{args_params_str}) -> {ret_ty} {{\n    unsafe {{ {exported_name}(vmctx, caller_vmctx{args_call_str}) }}\n}}\n"
+        ));
+    }
+    driver.push('\n');
+
+    for case in cases {
         let args_call_str = format_c_arg_calls(&case.args);
 
         let arg_assignments = case
@@ -563,57 +629,47 @@ fn generate_c_driver(cases: &[PreparedCase], verbose: bool) -> String {
             .join("\n");
 
         let ret_ty = case.expected.c_type_name();
-        let got_decl = format!("{} got", ret_ty);
+        let exported_name = exported_symbol_name(&case.symbol_name);
+        let wrapper_name = format!("{}_wrapper", sanitize_rust_ident(&exported_name));
+        let got_decl = format!(
+            "    let got: {ret_ty} = unsafe {{\n        {wrapper_name}(buf.as_mut_ptr(), buf.as_mut_ptr(){args_call_str})\n    }};",
+            ret_ty = ret_ty,
+            wrapper_name = wrapper_name,
+            args_call_str = args_call_str,
+        );
         let compare_stmt = case.expected.c_compare_stmt("got");
         let got_literal_stmt = case.expected.c_got_literal_stmt();
         let expected_literal = case.expected.c_expected_literal();
         let case_label = format!("{}", case.index);
 
-        let exported_name = exported_symbol_name(&case.symbol_name);
-
-        driver.push_str(&c_driver_prototype(
-            ret_ty,
-            &exported_name,
-            &args_params_str,
+        driver.push_str(&rust_driver_main(
+            DriverMainContext {
+                store_ctx_off: case.store_ctx_off,
+                sc_base,
+                export_name: &wrapper_name,
+                runner_name: &case.runner_name,
+                case_label: &case_label,
+                arg_assignments: &arg_assignments,
+                got_decl: &got_decl,
+                args_call: &args_call_str,
+                compare_stmt: &compare_stmt,
+                got_literal_stmt: &got_literal_stmt,
+                expected_literal: &expected_literal,
+            },
+            verbose,
         ));
-        driver.push_str("\n\n");
-        driver.push_str(&c_driver_main(CDriverMainContext {
-            store_ctx_off: case.store_ctx_off,
-            sc_base,
-            export_name: &exported_name,
-            runner_name: &case.runner_name,
-            case_label: &case_label,
-            arg_assignments: &arg_assignments,
-            got_decl: &got_decl,
-            args_call: &args_call_str,
-            compare_stmt: &compare_stmt,
-            got_literal_stmt: &got_literal_stmt,
-            expected_literal: &expected_literal,
-        }));
-        driver.push_str("\n\n");
+        driver.push('\n');
     }
 
-    driver.push_str("int main(void) {\n");
-    driver.push_str("    int passed = 0;\n");
-    driver.push_str("    int failed = 0;\n");
-    for (idx, case) in cases.iter().enumerate() {
-        driver.push_str(&format!("    int result_{idx} = {}();\n", case.runner_name));
-        driver.push_str(&format!("    if (result_{idx} == 0) {{\n"));
-        driver.push_str("        passed += 1;\n");
-        driver.push_str(
-            "    } else {
-",
-        );
-        driver.push_str("        failed += 1;\n");
-        driver.push_str(
-            "    }
-",
-        );
+    driver.push_str("fn main() {\n");
+    driver.push_str("    let mut failed = false;\n");
+    for case in cases {
+        driver.push_str(&format!("    failed |= !{}();\n", case.runner_name));
     }
-    if verbose {
-        driver.push_str("    printf(\"RESULT passed=%d failed=%d\\n\", passed, failed);\n");
-    }
-    driver.push_str("    return failed;\n}\n");
+    driver.push_str(
+        "    std::process::exit(if failed { 1 } else { 0 });\n}
+",
+    );
     driver
 }
 
@@ -632,30 +688,14 @@ fn parse_result_summary(output: &str) -> Option<(u32, u32)> {
 }
 
 struct Toolchain {
-    compiler: std::path::PathBuf,
+    linker: std::path::PathBuf,
     sysroot: Option<std::path::PathBuf>,
     qemu: std::path::PathBuf,
 }
 
 fn locate_toolchain() -> Result<Toolchain> {
-    let compiler_candidates = [
-        "arm-linux-gnueabihf-gcc",
-        "arm-linux-gnueabihf-gcc-13",
-        "arm-linux-gnueabihf-gcc-12",
-        "arm-linux-gnueabihf-gcc-11",
-        "arm-none-eabi-gcc",
-    ];
     let qemu_candidates = ["qemu-arm-static", "qemu-arm"];
 
-    let compiler = compiler_candidates
-        .iter()
-        .find_map(|name| find_executable(name))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not find an ARM cross-compiler; tried {:?}",
-                compiler_candidates
-            )
-        })?;
     let qemu = qemu_candidates
         .iter()
         .find_map(|name| find_executable(name))
@@ -663,9 +703,13 @@ fn locate_toolchain() -> Result<Toolchain> {
             anyhow::anyhow!("could not find QEMU for ARM; tried {:?}", qemu_candidates)
         })?;
 
-    let sysroot = detect_sysroot(&compiler).or_else(detect_sysroot_from_env);
+    let linker = find_arm_cross_linker().ok_or_else(|| {
+        anyhow::anyhow!("could not find ARM cross linker; install arm-linux-gnueabihf-gcc")
+    })?;
+
+    let sysroot = detect_sysroot_from_env().or_else(detect_sysroot_from_known_locations);
     Ok(Toolchain {
-        compiler,
+        linker,
         sysroot,
         qemu,
     })
@@ -679,26 +723,17 @@ fn find_executable(name: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-fn detect_sysroot(compiler: &std::path::Path) -> Option<std::path::PathBuf> {
-    let output = std::process::Command::new(compiler)
-        .arg("-print-sysroot")
-        .output()
-        .ok()?;
-    let sysroot = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let sysroot = if sysroot.is_empty() || sysroot == "/" {
-        None
-    } else {
-        Some(std::path::PathBuf::from(sysroot))
-    };
+fn find_arm_cross_linker() -> Option<std::path::PathBuf> {
+    find_executable("arm-linux-gnueabihf-gcc")
+}
 
-    sysroot.or_else(|| {
-        [
-            std::path::PathBuf::from("/usr/arm-linux-gnueabihf"),
-            std::path::PathBuf::from("/usr/arm-linux-gnueabihf/lib"),
-        ]
-        .into_iter()
-        .find(|path| path.join("lib/ld-linux-armhf.so.3").is_file())
-    })
+fn detect_sysroot_from_known_locations() -> Option<std::path::PathBuf> {
+    [
+        std::path::PathBuf::from("/usr/arm-linux-gnueabihf"),
+        std::path::PathBuf::from("/usr/arm-linux-gnueabihf/lib"),
+    ]
+    .into_iter()
+    .find(|path| path.join("lib/ld-linux-armhf.so.3").is_file())
 }
 
 fn detect_sysroot_from_env() -> Option<std::path::PathBuf> {
@@ -707,27 +742,39 @@ fn detect_sysroot_from_env() -> Option<std::path::PathBuf> {
         .or_else(|| std::env::var_os("CROSS_SYSROOT").map(std::path::PathBuf::from))
 }
 
-fn link_with_gcc(
-    gcc_path: &Path,
-    sysroot: &Option<PathBuf>,
+fn link_with_rustc(
+    linker_path: &Path,
+    _sysroot: &Option<PathBuf>,
     obj_path: &Path,
     driver_path: &Path,
     elf_path: &Path,
 ) -> Result<()> {
-    let mut command = std::process::Command::new(gcc_path);
-    command
-        .arg("-marm")
-        .arg(driver_path)
-        .arg(obj_path)
-        .arg("-o")
-        .arg(elf_path);
-    if let Some(sysroot) = sysroot {
-        command.arg("-L").arg(sysroot.join("lib"));
-    }
-    let status = command.status()?;
+    let rustc_path = std::env::var_os("RUSTC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("rustc"));
 
-    if !status.success() {
-        anyhow::bail!("linking failed with status: {}", status);
+    let mut compile_command = std::process::Command::new(&rustc_path);
+    let target = "armv7-unknown-linux-gnueabihf";
+
+    compile_command
+        .arg("--target")
+        .arg(target)
+        .arg("-C")
+        .arg("panic=abort")
+        .arg("-C")
+        .arg(format!("linker={}", linker_path.display()))
+        .arg("-C")
+        .arg(format!("link-arg={}", obj_path.display()))
+        .arg("-o")
+        .arg(elf_path)
+        .arg(driver_path);
+
+    let compile_status = compile_command.status()?;
+    if !compile_status.success() {
+        anyhow::bail!(
+            "Rust driver compilation failed with status: {}",
+            compile_status
+        );
     }
     Ok(())
 }
@@ -776,10 +823,9 @@ mod tests {
             expected: CaseValue::F32(FloatConst::Value(1.0)),
             store_ctx_off: 0,
         };
-        let driver = generate_c_driver(&[prepared], false);
-        assert!(driver.contains("#define WAST_ARM_RUNTTEST_VERBOSE 0"));
-        assert!(!driver.contains("RESULT"));
-        assert!(!driver.contains("PASS case"));
+        let driver = generate_rust_driver(&[prepared], false);
+        assert!(driver.contains("fn main()"));
+        assert!(!driver.contains("println!(\"PASS case"));
     }
 
     #[test]
@@ -811,36 +857,9 @@ mod tests {
             expected: CaseValue::F32(FloatConst::Value(1.0)),
             store_ctx_off: 0,
         };
-        let driver = generate_c_driver(&[prepared], true);
-        assert!(driver.contains("#define WAST_ARM_RUNTTEST_VERBOSE 1"));
-        assert!(driver.contains("RESULT passed=%d failed=%d"));
-    }
-
-    #[test]
-    fn generated_driver_uses_unique_result_names_per_case() {
-        let prepared_a = PreparedCase {
-            index: 0,
-            symbol_name: "f".to_string(),
-            runner_name: "run_f".to_string(),
-            bytes: vec![],
-            alignment: 0,
-            args: vec![],
-            expected: CaseValue::F32(FloatConst::Value(1.0)),
-            store_ctx_off: 0,
-        };
-        let prepared_b = PreparedCase {
-            index: 1,
-            symbol_name: "g".to_string(),
-            runner_name: "run_g".to_string(),
-            bytes: vec![],
-            alignment: 0,
-            args: vec![],
-            expected: CaseValue::F32(FloatConst::Value(1.0)),
-            store_ctx_off: 0,
-        };
-        let driver = generate_c_driver(&[prepared_a, prepared_b], false);
-        assert!(driver.contains("int result_0 = run_f();"));
-        assert!(driver.contains("int result_1 = run_g();"));
+        let driver = generate_rust_driver(&[prepared], true);
+        assert!(driver.contains("fn main()"));
+        assert!(driver.contains("println!(\"PASS case 0"));
     }
 
     #[test]
@@ -860,6 +879,84 @@ mod tests {
             exported_symbol_name("wast_arm_runtest_module_case_0_foo"),
             "wast_arm_runtest_module_case_0_foo"
         );
+    }
+
+    #[test]
+    fn generate_rust_driver_deduplicates_shared_symbols() {
+        let prepared = PreparedCase {
+            index: 0,
+            symbol_name: "shared".to_string(),
+            runner_name: "run_shared".to_string(),
+            bytes: vec![],
+            alignment: 0,
+            args: vec![],
+            expected: CaseValue::I32(0),
+            store_ctx_off: 0,
+        };
+        let driver = generate_rust_driver(&[prepared.clone(), prepared], false);
+        let export_decl_count = driver
+            .lines()
+            .filter(|line| {
+                line.trim_start()
+                    .starts_with("fn wast_arm_runtest_module_shared")
+            })
+            .filter(|line| !line.contains("_wrapper"))
+            .count();
+        assert_eq!(export_decl_count, 1);
+    }
+
+    #[test]
+    fn finds_arm_cross_linker_when_available() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "wast-arm-runtest-linker-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let linker_path = temp_dir.join("arm-linux-gnueabihf-gcc");
+        std::fs::write(&linker_path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&linker_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&linker_path, perms).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        let new_path = std::env::join_paths(
+            std::iter::once(temp_dir.clone()).chain(
+                old_path
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|p| std::env::split_paths(p)),
+            ),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+        let resolved = find_arm_cross_linker();
+        if let Some(old_path) = old_path {
+            unsafe {
+                std::env::set_var("PATH", old_path);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("PATH");
+            }
+        }
+
+        assert!(resolved.is_some());
+        assert_eq!(
+            resolved.unwrap().file_name().unwrap(),
+            "arm-linux-gnueabihf-gcc"
+        );
+    }
+
+    #[test]
+    fn detects_arm_sysroot_when_present() {
+        let sysroot = detect_sysroot_from_known_locations();
+        assert!(sysroot.is_none() || sysroot.as_ref().unwrap().ends_with("arm-linux-gnueabihf"));
     }
 
     #[test]
